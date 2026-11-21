@@ -89,17 +89,27 @@ if SERVER then
         return Angle(a.p+MODEL_ANG.p, a.y+MODEL_ANG.y, a.r+MODEL_ANG.r)
     end
 
-    local function predictImpact(pos, dir, speed)
+    local function predictTrajectory(pos, dir, speed)
+        local points = { pos }
         local p, v = pos, dir * speed
         local dt = 0.05
-        for i = 1, 600 do
+        local sampleEvery = 6 -- 0.3 s between points keeps the HUD curve smooth without large net messages
+        local steps = math.min(600, math.ceil(MAX_FLIGHT / dt))
+
+        for i = 1, steps do
             v = v - Vector(0,0,GRAVITY*dt)
             local np = p + v*dt
             local tr = trace.line(p, np, { chip(), owner() })
-            if tr.Hit then return tr.HitPos end
+            if tr.Hit then
+                points[#points + 1] = tr.HitPos
+                return points
+            end
             p = np
+            if i % sampleEvery == 0 then points[#points + 1] = p end
         end
-        return p
+
+        if steps % sampleEvery ~= 0 then points[#points + 1] = p end
+        return points
     end
 
     local function applyBlastDamage(pos)
@@ -161,14 +171,17 @@ if SERVER then
         local dt = math.min(t - lastThink, 0.1)
         lastThink = t
 
-        --     
+        -- Send the predicted arc only to the owner, and only while they are seated.
         local ow = owner()
         if ow and ow:isValid() and ow:inVehicle() and t - lastPredict > PREDICT_RATE then
             lastPredict = t
             local pos, dir, speed = fireParams()
-            local impact = predictImpact(pos, dir, speed)
+            local points = predictTrajectory(pos, dir, speed)
             net.start("arty_predict")
-            net.writeVector(impact)
+            net.writeUInt(#points, 7)
+            for _, point in ipairs(points) do
+                net.writeVector(point)
+            end
             net.send(ow)
         end
 
@@ -377,13 +390,19 @@ if CLIENT then
     end
 
     -- =====   (   ) =====
-    local predictPos, marker
+    local trajectory, predictPos, marker
     local function seatedOwner()
         local lp = player()
         return lp and lp:isValid() and lp == owner() and lp:inVehicle()
     end
     local function updateMarker()
-        if predictPos and seatedOwner() then
+        local seated = seatedOwner()
+        if not seated then
+            trajectory = nil
+            predictPos = nil
+        end
+
+        if predictPos and seated then
             if not marker or not marker:isValid() then
                 marker = hologram.create(predictPos, Angle(0,0,0), MARKER_MODEL)
                 if marker then marker:setColor(MARKER_COLOR) end
@@ -395,15 +414,35 @@ if CLIENT then
         end
     end
     net.receive("arty_predict", function()
-        predictPos = net.readVector()
+        local count = net.readUInt(7)
+        local points = {}
+        for i = 1, count do
+            points[i] = net.readVector()
+        end
+        if count >= 2 and seatedOwner() then
+            trajectory = points
+            predictPos = points[count]
+        else
+            trajectory = nil
+            predictPos = nil
+        end
         updateMarker()
     end)
     hook.add("think", "arty_marker", updateMarker)
 
-    --  HUD (  Starfall HUD)
+    -- Draw the trajectory and impact point only on the seated owner's HUD.
     hook.add("drawhud", "arty_hud", function()
-        if not predictPos or not seatedOwner() then return end
+        if not trajectory or #trajectory < 2 or not seatedOwner() then return end
         pcall(function()
+            render.setColor(Color(255,190,70,220))
+            for i = 1, #trajectory - 1 do
+                local a = trajectory[i]:toScreen()
+                local b = trajectory[i + 1]:toScreen()
+                if a and b and a.visible and b.visible then
+                    render.drawLine(a.x, a.y, b.x, b.y)
+                end
+            end
+
             local scr = predictPos:toScreen()
             if scr and scr.visible then
                 render.setColor(Color(0,255,0,220))
