@@ -44,14 +44,17 @@ local TRAIL_START = 14
 local TRAIL_END   = 2
 local TRAIL_LIFE  = 0.7
 
-local BOOM_SCALE = 40
-local BOOM_FX    = { "explosion_huge", "explosion_huge_b", "building_explosion", "generic_smoke" }
+local BOOM_SCALE = 60
+local BOOM_FIRE_FX = { "explosion_huge", "explosion_huge_b", "building_explosion" }
+local BOOM_SMOKE_FX = { "generic_smoke", "smokegrenade", "smoke_trail" }
 local SMOKE_FX   = "smoke_trail"
 local ANCHOR_MODEL = "models/hunter/blocks/cube025x025x025.mdl"
 local MUZZLE_3D_MODEL = "models/hunter/misc/sphere025x025.mdl"
 local MUZZLE_MATERIAL = "models/debug/debugwhite"
-local IMPACT_CAMERA_HEIGHT = 3500
-local IMPACT_CAMERA_SPAN = 1800
+local IMPACT_SMOKE_MAT = "particle/particle_smokegrenade"
+local IMPACT_FLAME_MAT = "sprites/flamelet1"
+local IMPACT_CAMERA_HEIGHT = 2000
+local IMPACT_CAMERA_FOV = 75
 local DAMAGE_LIMIT = 10000
 local RADIUS_LIMIT = 10000
 
@@ -220,9 +223,10 @@ if SERVER then
         net.writeUInt(s.id, 16)
         net.writeVector(pos)
         net.send()
-        effect.create("Explosion", { origin = pos, scale = BOOM_SCALE })
-        effect.create("HelicopterMegaBomb", { origin = pos, scale = BOOM_SCALE })
-        effect.beamRingPoint(pos, 0.8, 30, getRadius(), 36, 8, Color(255, 200, 120))
+        effect.create("Explosion", { origin = pos, scale = BOOM_SCALE, magnitude = BOOM_SCALE })
+        effect.create("HelicopterMegaBomb", { origin = pos, scale = BOOM_SCALE, magnitude = BOOM_SCALE })
+        local shockwaveRadius = math.max(getRadius(), 1400)
+        effect.beamRingPoint(pos, 1.1, 45, shockwaveRadius, 52, 12, Color(255, 190, 115))
         pcall(applyBlastDamage, pos)
     end
 
@@ -292,24 +296,102 @@ end
 -- =====================  =====================
 if CLIENT then
     local fxSet
-    local function pickFx(cands)
+    local function getFxSet()
         if not fxSet or next(fxSet) == nil then
             fxSet = {}
-            for _, n in ipairs(particleEffect.getList()) do fxSet[n] = true end
+            for _, n in ipairs(particleEffect.getList()) do fxSet[string.lower(n)] = n end
         end
-        for _, n in ipairs(cands) do if fxSet[n] then return n end end
+        return fxSet
+    end
+    local function pickFx(cands)
+        local available = getFxSet()
+        for _, n in ipairs(cands) do
+            local found = available[string.lower(n)]
+            if found then return found end
+        end
+        return nil
+    end
+    local function pickFxContaining(word, excluded)
+        local available = getFxSet()
+        for lower, original in pairs(available) do
+            if string.find(lower, word, 1, true)
+                and (not excluded or not string.find(lower, excluded, 1, true)) then
+                return original
+            end
+        end
         return nil
     end
     local function anchor(pos, ang)
         local h = hologram.create(pos, ang or Angle(0,0,0), ANCHOR_MODEL)
-        if h then h:setColor(Color(255,255,255,0)) end
+        if h then pcall(function() h:setColor(Color(255,255,255,0)) end) end
         return h
     end
     local function attach(h, name)
-        if not h or not name or not hasPermission("particleEffect.attach") then return nil end
+        if not h or not name or not hasPermission("particleEffect.attach", h) then return nil end
         local ok, fx = pcall(particleEffect.attach, h, name, 1)
         if ok then return fx end
         return nil
+    end
+
+    local impactMaterials = {}
+    local function loadImpactMaterial(path)
+        if impactMaterials[path] then return impactMaterials[path] end
+        if not hasPermission("material.load", path) then return nil end
+        local ok, mat = pcall(material.load, path)
+        if ok and mat then impactMaterials[path] = mat end
+        return ok and mat or nil
+    end
+    local function addImpactParticle(em, mat, pos, startSize, endSize, alpha, life, velocity, gravity, air, color)
+        if not mat then return false end
+        local ok, spawned = pcall(function()
+            local p = em:add(mat, pos, startSize, endSize, 0, 0, alpha, 0, life)
+            if not p then return false end
+            p:setVelocity(velocity)
+            p:setGravity(gravity)
+            p:setAirResistance(air)
+            p:setColor(color)
+            return true
+        end)
+        return ok and spawned == true
+    end
+    local function impactCloudFx(pos)
+        if not hasPermission("particle.create") then return end
+        local smokeMat = loadImpactMaterial(IMPACT_SMOKE_MAT)
+        local flameMat = loadImpactMaterial(IMPACT_FLAME_MAT)
+        if not smokeMat and not flameMat then return end
+
+        local ok, em = pcall(particle.create, pos, true)
+        if not ok or not em then return end
+        pcall(function() em:setParticleCullRadius(1800) end)
+
+        if smokeMat then
+            for i = 1, 44 do
+                local direction = Vector(math.random(-100, 100), math.random(-100, 100), math.random(-15, 100))
+                local length = direction:getLength()
+                if length > 0 then direction = direction / length end
+                local velocity = direction * math.random(140, 360) + Vector(0, 0, math.random(90, 220))
+                local life = math.random(50, 75) / 10
+                addImpactParticle(em, smokeMat, pos + Vector(0, 0, math.random(0, 36)),
+                    math.random(85, 135), math.random(480, 820), math.random(175, 225), life,
+                    velocity, Vector(0, 0, math.random(12, 32)), math.random(18, 28) / 10,
+                    Color(math.random(68, 98), math.random(66, 94), math.random(64, 92)))
+            end
+        end
+
+        if flameMat then
+            for i = 1, 20 do
+                local direction = Vector(math.random(-100, 100), math.random(-100, 100), math.random(-25, 100))
+                local length = direction:getLength()
+                if length > 0 then direction = direction / length end
+                local velocity = direction * math.random(450, 1050) + Vector(0, 0, math.random(120, 420))
+                addImpactParticle(em, flameMat, pos + direction * math.random(0, 45),
+                    math.random(100, 175), math.random(12, 35), 255, math.random(28, 65) / 100,
+                    velocity, Vector(0, 0, math.random(-300, -120)), math.random(18, 28) / 10,
+                    Color(255, math.random(82, 170), math.random(18, 42)))
+            end
+        end
+
+        pcall(function() em:destroy() end)
     end
 
     -- =====  =====
@@ -399,10 +481,23 @@ if CLIENT then
     end)
 
     local function bigBoomFx(pos)
-        local h = anchor(pos + Vector(0,0,10))
-        local fx = attach(h, pickFx(BOOM_FX))
-        timer.simple(7, function()
-            if fx and fx:isValid() then fx:destroy() end
+        pcall(impactCloudFx, pos)
+        local h = anchor(pos + Vector(0,0,12))
+        if not h then return end
+
+        local fireName = pickFx(BOOM_FIRE_FX) or pickFxContaining("explosion")
+        local smokeName = pickFx(BOOM_SMOKE_FX) or pickFxContaining("smoke", "trail")
+        local effects = {}
+        local fireFx = attach(h, fireName)
+        local smokeFx
+        if smokeName and smokeName ~= fireName then smokeFx = attach(h, smokeName) end
+        if fireFx then effects[#effects + 1] = fireFx end
+        if smokeFx then effects[#effects + 1] = smokeFx end
+
+        timer.simple(8, function()
+            for _, fx in ipairs(effects) do
+                if fx and fx:isValid() then fx:destroy() end
+            end
             if h and h:isValid() then h:remove() end
         end)
     end
@@ -422,8 +517,8 @@ if CLIENT then
     local function setupImpactCameraRequest()
         if permissionSetup or not isOwnerClient() then return end
         local ok = pcall(setupPermissionRequest,
-            { "render.calcview", "input" },
-            "Hold G to view the predicted impact point from above.", true
+            { "render.calcview", "input", "particle.create", "material.load", "particleEffect.attach" },
+            "Hold G for the impact view and allow the layered explosion visuals.", true
         )
         if ok then permissionSetup = true end
     end
@@ -432,6 +527,11 @@ if CLIENT then
     local function hasImpactCameraPermission()
         return permissionSetup and isOwnerClient()
             and hasPermission("render.calcview") and hasPermission("input")
+    end
+    local function hasImpactFxPermissions()
+        return hasPermission("particle.create")
+            and hasPermission("material.load", IMPACT_SMOKE_MAT)
+            and hasPermission("material.load", IMPACT_FLAME_MAT)
     end
 
     local function impactCameraHeld()
@@ -443,7 +543,7 @@ if CLIENT then
     hook.add("think", "arty_impact_camera_permission", function()
         if not isOwnerClient() or not seatedOwner() then return end
         setupImpactCameraRequest()
-        if cameraPromptSent or hasImpactCameraPermission() then return end
+        if cameraPromptSent or (hasImpactCameraPermission() and hasImpactFxPermissions()) then return end
         local now = timer.realtime()
         if now - lastPermissionTry < 1 then return end
         lastPermissionTry = now
@@ -459,17 +559,12 @@ if CLIENT then
 
     hook.add("calcview", "arty_impact_camera", function(pos, ang, fov)
         if not impactCameraHeld() then return end
+        -- Use a normal perspective CalcView here; ortho/clipping overrides can render black in-game.
         return {
             origin = predictPos + Vector(0, 0, IMPACT_CAMERA_HEIGHT),
             angles = Angle(90, 0, 0),
-            fov = fov,
-            znear = 1,
-            zfar = IMPACT_CAMERA_HEIGHT * 6,
-            drawviewer = true,
-            ortho = {
-                left = -IMPACT_CAMERA_SPAN, right = IMPACT_CAMERA_SPAN,
-                top = IMPACT_CAMERA_SPAN, bottom = -IMPACT_CAMERA_SPAN
-            }
+            fov = IMPACT_CAMERA_FOV,
+            drawviewer = true
         }
     end)
 
