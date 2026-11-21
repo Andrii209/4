@@ -49,13 +49,7 @@ local BOOM_FX    = { "explosion_huge", "explosion_huge_b", "building_explosion",
 local SMOKE_FX   = "smoke_trail"
 local ANCHOR_MODEL = "models/hunter/blocks/cube025x025x025.mdl"
 
-local MB_SMOKE_N    = 26
-local MB_SMOKE_SPD  = 620
-local MB_SMOKE_FWD  = 320
-local MB_SMOKE_SIZE = 240
-local MB_FLAME_N    = 24
-local MB_FLAME_SPD  = 1500
-local MB_FLAME_LIFE = 0.30
+local MUZZLE_SMOKE_LIFE = 2.5
 
 -- =====================  =====================
 if SERVER then
@@ -234,63 +228,15 @@ if CLIENT then
     end
 
     local function muzzleBlast(pos, dir)
-        local now   = timer.curtime()
-        local ang   = dir:getAngle()
-        local right = ang:getRight()
-        local up    = ang:getUp()
-        local em = particle.create(pos, true)
-        if not em then return end
+        local h = anchor(pos, dir:getAngle())
+        if not h then return end
 
-        for i = 1, MB_SMOKE_N do
-            local side = (i % 2 == 0) and 1 or -1
-            local vel = right * (side * math.random(220, MB_SMOKE_SPD))
-                      + dir * math.random(60, MB_SMOKE_FWD)
-                      + up  * math.random(20, 120)
-            local p = em:add("particle/particle_smokegrenade", pos + dir * math.random(0, 30))
-            if p then
-                p:setVelocity(vel)
-                p:setDieTime(now + math.random(14, 24) / 10)
-                p:setStartAlpha(math.random(170, 225))
-                p:setEndAlpha(0)
-                p:setStartSize(math.random(24, 44))
-                p:setEndSize(math.random(MB_SMOKE_SIZE * 0.6, MB_SMOKE_SIZE))
-                p:setGravity(Vector(0, 0, math.random(20, 60)))
-                p:setAirResistance(math.random(15, 30) / 10)
-                p:setColor(Color(35, 32, 30))
-            end
-        end
-
-        for i = 1, MB_FLAME_N do
-            local spread = right * math.random(-90, 90) + up * math.random(-90, 90)
-            local vel = dir * math.random(MB_FLAME_SPD * 0.5, MB_FLAME_SPD) + spread
-            local p = em:add("sprites/flamelet" .. math.random(1, 5), pos + dir * math.random(0, 20))
-            if p then
-                p:setVelocity(vel)
-                p:setDieTime(now + math.random(10, MB_FLAME_LIFE * 100) / 100)
-                p:setStartAlpha(255)
-                p:setEndAlpha(0)
-                p:setStartSize(math.random(30, 60))
-                p:setEndSize(math.random(70, 130))
-                p:setAirResistance(2)
-                p:setColor(Color(255, math.random(140, 210), 40))
-            end
-        end
-
-        for i = 1, 5 do
-            local p = em:add("sprites/flamelet1", pos + dir * 10)
-            if p then
-                p:setVelocity(dir * 200)
-                p:setDieTime(now + 0.12)
-                p:setStartAlpha(255)
-                p:setEndAlpha(0)
-                p:setStartSize(90)
-                p:setEndSize(170)
-                p:setColor(Color(255, 230, 170))
-            end
-        end
-
-        em:finish()
-        timer.simple(3, function() pcall(function() em:destroy() end) end)
+        -- A short-lived attached particle effect makes a visible smoke puff at the muzzle.
+        local fx = attach(h, pickFx({ SMOKE_FX, "generic_smoke" }))
+        timer.simple(MUZZLE_SMOKE_LIFE, function()
+            if fx and fx:isValid() then fx:destroy() end
+            if h and h:isValid() then h:remove() end
+        end)
     end
 
     -- =====  =====
@@ -429,10 +375,80 @@ if CLIENT then
     end)
     hook.add("think", "arty_marker", updateMarker)
 
-    -- Draw the trajectory and impact point only on the seated owner's HUD.
+    local function drawTopDownMap()
+        local screenW = render.getGameResolution()
+        local size = 184
+        local boxX, boxY = screenW - size - 18, 18
+        local plotSize = 132
+        local plotX = boxX + (size - plotSize) * 0.5
+        local plotY = boxY + 30
+
+        render.setColor(Color(8, 14, 22, 225))
+        render.drawRect(boxX, boxY, size, size)
+        render.setColor(Color(115, 145, 165, 240))
+        render.drawRectOutline(boxX, boxY, size, size, 1)
+        render.setColor(Color(235, 242, 248, 255))
+        render.drawSimpleText(boxX + 10, boxY + 8, "TOP-DOWN IMPACT", 0, 0)
+
+        render.setColor(Color(13, 22, 30, 235))
+        render.drawRect(plotX, plotY, plotSize, plotSize)
+        render.setColor(Color(70, 92, 108, 180))
+        render.drawRectOutline(plotX, plotY, plotSize, plotSize, 1)
+        render.drawLine(plotX + plotSize * 0.5, plotY + 3, plotX + plotSize * 0.5, plotY + plotSize - 3)
+        render.drawLine(plotX + 3, plotY + plotSize * 0.5, plotX + plotSize - 3, plotY + plotSize * 0.5)
+
+        if not trajectory or #trajectory < 2 then
+            render.setColor(Color(190, 200, 210, 230))
+            render.drawSimpleText(boxX + 10, boxY + size - 15, "WAITING FOR AIM", 0, 0)
+            return
+        end
+
+        local first = trajectory[1]
+        local minX, maxX = first.x, first.x
+        local minY, maxY = first.y, first.y
+        for i = 2, #trajectory do
+            local p = trajectory[i]
+            minX, maxX = math.min(minX, p.x), math.max(maxX, p.x)
+            minY, maxY = math.min(minY, p.y), math.max(maxY, p.y)
+        end
+
+        local centerX = (minX + maxX) * 0.5
+        local centerY = (minY + maxY) * 0.5
+        local worldSpan = math.max(maxX - minX, maxY - minY, 512) * 1.25
+        local scale = plotSize / worldSpan
+        local function mapPoint(p)
+            return plotX + plotSize * 0.5 + (p.x - centerX) * scale,
+                   plotY + plotSize * 0.5 - (p.y - centerY) * scale
+        end
+
+        render.setColor(Color(255, 178, 66, 235))
+        for i = 1, #trajectory - 1 do
+            local x1, y1 = mapPoint(trajectory[i])
+            local x2, y2 = mapPoint(trajectory[i + 1])
+            render.drawLine(x1, y1, x2, y2)
+        end
+
+        local startX, startY = mapPoint(first)
+        local impact = trajectory[#trajectory]
+        local impactX, impactY = mapPoint(impact)
+        render.setColor(Color(80, 205, 255, 255))
+        render.drawRect(startX - 3, startY - 3, 6, 6)
+        render.setColor(Color(255, 72, 64, 255))
+        render.drawRect(impactX - 4, impactY - 4, 8, 8)
+
+        local dx, dy = impact.x - first.x, impact.y - first.y
+        local rangeMeters = math.floor(math.sqrt(dx * dx + dy * dy) / 52.5)
+        render.setColor(Color(235, 242, 248, 255))
+        render.drawSimpleText(boxX + 10, boxY + size - 15, "RANGE " .. rangeMeters .. " m", 0, 0)
+    end
+
+    -- Draw the trajectory and top-down impact panel only on the seated owner's HUD.
     hook.add("drawhud", "arty_hud", function()
-        if not trajectory or #trajectory < 2 or not seatedOwner() then return end
+        if not seatedOwner() then return end
         pcall(function()
+            drawTopDownMap()
+            if not trajectory or #trajectory < 2 or not predictPos then return end
+
             render.setColor(Color(255,190,70,220))
             for i = 1, #trajectory - 1 do
                 local a = trajectory[i]:toScreen()
