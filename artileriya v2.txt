@@ -55,6 +55,7 @@ local IMPACT_CAMERA_HEIGHT = 1400
 local IMPACT_CAMERA_FOV = 52
 local IMPACT_CAMERA_ZNEAR = 8
 local IMPACT_CAMERA_ZFAR = 4200
+local IMPACT_CAMERA_SMOOTHING = 8
 local DAMAGE_LIMIT = 10000
 local RADIUS_LIMIT = 10000
 
@@ -540,11 +541,28 @@ if CLIENT then
 
     local impactCameraOffset = Vector(0, 0, IMPACT_CAMERA_HEIGHT)
     local impactCameraAngles = Angle(90, 0, 0)
-    hook.add("calcview", "arty_impact_camera", function(pos, ang, fov)
-        if not impactCameraHeld() then return end
+    local impactCameraPosition, impactCameraLastTime
+    hook.add("calcview", "arty_impact_camera", function()
+        if not impactCameraHeld() then
+            impactCameraPosition = nil
+            impactCameraLastTime = nil
+            return
+        end
+
+        local now = timer.realtime()
+        local target = predictPos + impactCameraOffset
+        if not impactCameraPosition then
+            impactCameraPosition = target
+        else
+            local dt = math.min(math.max(now - (impactCameraLastTime or now), 0), 0.1)
+            local blend = 1 - math.exp(-IMPACT_CAMERA_SMOOTHING * dt)
+            impactCameraPosition = impactCameraPosition + (target - impactCameraPosition) * blend
+        end
+        impactCameraLastTime = now
+
         -- Use a tight perspective view and clip distant geometry to keep the live scene light.
         return {
-            origin = predictPos + impactCameraOffset,
+            origin = impactCameraPosition,
             angles = impactCameraAngles,
             fov = IMPACT_CAMERA_FOV,
             znear = IMPACT_CAMERA_ZNEAR,
@@ -553,7 +571,7 @@ if CLIENT then
         }
     end)
 
-    local function updateMarker()
+    local function updateMarker(cameraActive)
         local seated = seatedOwner()
         if not seated then
             trajectory = nil
@@ -561,11 +579,15 @@ if CLIENT then
         end
 
         if predictPos and seated then
+            local markerPos = predictPos
+            if cameraActive and impactCameraPosition then
+                markerPos = impactCameraPosition - impactCameraOffset
+            end
             if not marker or not marker:isValid() then
-                marker = hologram.create(predictPos, Angle(0,0,0), MARKER_MODEL)
+                marker = hologram.create(markerPos, Angle(0,0,0), MARKER_MODEL)
                 if marker then marker:setColor(MARKER_COLOR) end
             end
-            if marker and marker:isValid() then marker:setPos(predictPos + Vector(0,0,2)) end
+            if marker and marker:isValid() then marker:setPos(markerPos + Vector(0,0,2)) end
         else
             if marker and marker:isValid() then marker:remove() end
             marker = nil
@@ -584,14 +606,15 @@ if CLIENT then
             trajectory = nil
             predictPos = nil
         end
-        updateMarker()
+        updateMarker(impactCameraHeld())
     end)
     local nextMarkerUpdate = 0
     hook.add("think", "arty_marker", function()
         local now = timer.realtime()
         if now < nextMarkerUpdate then return end
-        nextMarkerUpdate = now + PREDICT_RATE
-        updateMarker()
+        local cameraActive = impactCameraHeld()
+        nextMarkerUpdate = now + (cameraActive and 0.05 or PREDICT_RATE)
+        updateMarker(cameraActive)
     end)
 
     -- No render-target inset: the actual game view is switched only while G is held.
