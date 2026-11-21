@@ -26,7 +26,7 @@ local DAMAGE_DEBUG = false
 -- ####################   (   ) ####################
 local MARKER_MODEL = "models/hunter/tubes/tube2x2x025.mdl"
 local MARKER_COLOR = Color(0, 255, 0, 150)
-local PREDICT_RATE = 0.2   --     ()
+local PREDICT_RATE = 0.3   -- Keep the impact camera responsive without over-tracing the arc.
 
 -- =====================  =====================
 local MODEL      = "models/props_junk/propane_tank001a.mdl"
@@ -49,12 +49,12 @@ local BOOM_FIRE_FX = { "explosion_huge", "explosion_huge_b", "building_explosion
 local BOOM_SMOKE_FX = { "generic_smoke", "smokegrenade", "smoke_trail" }
 local SMOKE_FX   = "smoke_trail"
 local ANCHOR_MODEL = "models/hunter/blocks/cube025x025x025.mdl"
-local MUZZLE_3D_MODEL = "models/hunter/misc/sphere025x025.mdl"
-local MUZZLE_MATERIAL = "models/debug/debugwhite"
 local IMPACT_SMOKE_MAT = "particle/particle_smokegrenade"
 local IMPACT_FLAME_MAT = "sprites/flamelet1"
-local IMPACT_CAMERA_HEIGHT = 2000
-local IMPACT_CAMERA_FOV = 75
+local IMPACT_CAMERA_HEIGHT = 1400
+local IMPACT_CAMERA_FOV = 52
+local IMPACT_CAMERA_ZNEAR = 8
+local IMPACT_CAMERA_ZFAR = 4200
 local DAMAGE_LIMIT = 10000
 local RADIUS_LIMIT = 10000
 
@@ -101,9 +101,9 @@ if SERVER then
     local function predictTrajectory(pos, dir, speed)
         local points = { pos }
         local p, v = pos, dir * speed
-        local dt = 0.05
-        local sampleEvery = 6 -- 0.3 s between points keeps the HUD curve smooth without large net messages
-        local steps = math.min(600, math.ceil(MAX_FLIGHT / dt))
+        local dt = 0.075
+        local sampleEvery = 4 -- Keep 0.3 s HUD spacing while using fewer collision traces.
+        local steps = math.min(270, math.ceil(MAX_FLIGHT / dt))
 
         for i = 1, steps do
             v = v - Vector(0,0,GRAVITY*dt)
@@ -119,77 +119,6 @@ if SERVER then
 
         if steps % sampleEvery ~= 0 then points[#points + 1] = p end
         return points
-    end
-
-    -- These are short-lived, networked hologram meshes, so the muzzle burst has real 3D volume.
-    local muzzleOrbs, lastMuzzleFxUpdate = {}, 0
-    local function createMuzzleOrb(pos, ang, velocity, scale, color, life, growth, lift)
-        local ok, h = pcall(hologram.create, pos, ang, MUZZLE_3D_MODEL, scale)
-        if not ok or not h then return end
-
-        pcall(function() h:setMaterial(MUZZLE_MATERIAL) end)
-        pcall(function() h:suppressEngineLighting(true) end)
-        pcall(function() h:setColor(color) end)
-
-        muzzleOrbs[#muzzleOrbs + 1] = {
-            holo = h, origin = pos, velocity = velocity,
-            acceleration = Vector(0, 0, lift), scale = scale,
-            color = color, life = life, growth = growth, born = timer.curtime()
-        }
-    end
-
-    local function updateMuzzleOrbs(now)
-        if now - lastMuzzleFxUpdate < 0.05 then return end
-        lastMuzzleFxUpdate = now
-        for i = #muzzleOrbs, 1, -1 do
-            local fx = muzzleOrbs[i]
-            local age = now - fx.born
-            if age >= fx.life or not fx.holo:isValid() then
-                if fx.holo:isValid() then pcall(function() fx.holo:remove() end) end
-                table.remove(muzzleOrbs, i)
-            else
-                local t = age / fx.life
-                local scaleFactor = 1 + (fx.growth - 1) * t
-                local alpha = math.floor(fx.color.a * (1 - t) * (1 - t))
-                pcall(function()
-                    fx.holo:setPos(fx.origin + fx.velocity * age + fx.acceleration * (0.5 * age * age))
-                    fx.holo:setScale(fx.scale * scaleFactor)
-                    fx.holo:setColor(Color(fx.color.r, fx.color.g, fx.color.b, alpha))
-                end)
-            end
-        end
-    end
-
-    local function spawnMuzzle3DFx(pos, dir)
-        local ang = dir:getAngle()
-        local right = ang:getRight()
-        local up = Vector(0, 0, 1)
-        local origin = pos + dir * 14
-
-        createMuzzleOrb(origin, ang, dir * 100, Vector(5.0, 3.0, 3.0),
-            Color(255, 225, 135, 250), 0.14, 0.12, 0)
-
-        for i = 1, 5 do
-            local offset = right * math.random(-24, 24) + up * math.random(-20, 20)
-            local velocity = dir * math.random(180, 430)
-                + right * math.random(-120, 120) + up * math.random(-60, 95)
-            local scale = Vector(math.random(24, 42) / 10,
-                math.random(14, 24) / 10, math.random(14, 24) / 10)
-            local color = Color(255, math.random(100, 190), math.random(24, 48), 240)
-            createMuzzleOrb(origin + offset, velocity:getAngle(), velocity, scale,
-                color, math.random(18, 32) / 100, 0.18, -80)
-        end
-
-        for i = 1, 7 do
-            local offset = right * math.random(-34, 34) + up * math.random(-14, 25)
-            local velocity = dir * math.random(20, 100)
-                + right * math.random(-55, 55) + up * math.random(45, 115)
-            local scale = Vector(math.random(22, 36) / 10,
-                math.random(22, 36) / 10, math.random(22, 36) / 10)
-            local color = Color(math.random(92, 126), math.random(88, 116), math.random(82, 108), 105)
-            createMuzzleOrb(origin + offset, Angle(0, 0, 0), velocity, scale,
-                color, math.random(18, 27) / 10, 1.9, math.random(8, 18))
-        end
     end
 
     local function applyBlastDamage(pos)
@@ -237,7 +166,6 @@ if SERVER then
         local pos, dir, speed = fireParams()
         local holo = hologram.create(pos, shellAng(dir), MODEL)
         if not holo then return end
-        pcall(spawnMuzzle3DFx, pos, dir)
         holo:setTrails(TRAIL_START, TRAIL_END, TRAIL_LIFE, TRAIL_MAT, TRAIL_COLOR, nil, true)
         shotId = (shotId + 1) % 65536
         shells[shotId] = { id = shotId, holo = holo, pos = pos, vel = dir * speed, born = t }
@@ -245,6 +173,7 @@ if SERVER then
         net.writeUInt(shotId, 16)
         net.writeEntity(holo)
         net.writeVector(pos)
+        net.writeVector(dir)
         net.send()
     end
 
@@ -252,7 +181,6 @@ if SERVER then
         local t = timer.curtime()
         local dt = math.min(t - lastThink, 0.1)
         lastThink = t
-        updateMuzzleOrbs(t)
 
         -- Send the predicted arc only to the owner, and only while they are seated.
         local ow = owner()
@@ -341,10 +269,12 @@ if CLIENT then
         if ok and mat then impactMaterials[path] = mat end
         return ok and mat or nil
     end
-    local function addImpactParticle(em, mat, pos, startSize, endSize, alpha, life, velocity, gravity, air, color)
+    local function addImpactParticle(em, mat, pos, startSize, endSize, alpha, life,
+        velocity, gravity, air, color, startLength, endLength)
         if not mat then return false end
         local ok, spawned = pcall(function()
-            local p = em:add(mat, pos, startSize, endSize, 0, 0, alpha, 0, life)
+            local p = em:add(mat, pos, startSize, endSize,
+                startLength or 0, endLength or 0, alpha, 0, life)
             if not p then return false end
             p:setVelocity(velocity)
             p:setGravity(gravity)
@@ -354,6 +284,57 @@ if CLIENT then
         end)
         return ok and spawned == true
     end
+
+    local lastMuzzleFlash
+    local function muzzleFlashFx(pos, dir)
+        if not hasPermission("particle.create") then return end
+        local flameMat = loadImpactMaterial(IMPACT_FLAME_MAT)
+        local smokeMat = loadImpactMaterial(IMPACT_SMOKE_MAT)
+        if not flameMat and not smokeMat then return end
+
+        local now = timer.realtime()
+        if lastMuzzleFlash and now - lastMuzzleFlash < 0.14 then return end
+        lastMuzzleFlash = now
+
+        local dirLength = dir:getLength()
+        if dirLength <= 0 then return end
+        dir = dir / dirLength
+        local right = dir:getAngle():getRight()
+        local up = Vector(0, 0, 1)
+        local origin = pos + dir * 14
+        local ok, em = pcall(particle.create, origin, true)
+        if not ok or not em then return end
+        pcall(function() em:setParticleCullRadius(500) end)
+
+        if flameMat then
+            addImpactParticle(em, flameMat, origin, 58, 5, 255, 0.12,
+                dir * 720, Vector(0, 0, 0), 1.8, Color(255, 235, 190))
+            for i = 1, 4 do
+                local velocity = dir * math.random(420, 850)
+                    + right * math.random(-90, 90) + up * math.random(-55, 85)
+                addImpactParticle(em, flameMat, origin + dir * math.random(0, 18),
+                    math.random(12, 20), math.random(2, 5), 220, math.random(12, 22) / 100,
+                    velocity, Vector(0, 0, -35), 2.2, Color(255, math.random(150, 210), 105),
+                    math.random(10, 18), math.random(34, 62))
+            end
+        end
+
+        if smokeMat then
+            for i = 1, 9 do
+                local velocity = dir * math.random(50, 140)
+                    + right * math.random(-75, 75) + up * math.random(18, 85)
+                local life = math.random(8, 11) / 10
+                addImpactParticle(em, smokeMat, origin + dir * math.random(0, 26)
+                    + up * math.random(-6, 14), math.random(18, 30), math.random(90, 155),
+                    math.random(125, 170), life, velocity, Vector(0, 0, math.random(5, 18)),
+                    math.random(18, 26) / 10,
+                    Color(math.random(72, 92), math.random(70, 88), math.random(68, 84)))
+            end
+        end
+
+        pcall(function() em:destroy() end)
+    end
+
     local function impactCloudFx(pos)
         if not hasPermission("particle.create") then return end
         local smokeMat = loadImpactMaterial(IMPACT_SMOKE_MAT)
@@ -518,7 +499,7 @@ if CLIENT then
         if permissionSetup or not isOwnerClient() then return end
         local ok = pcall(setupPermissionRequest,
             { "render.calcview", "input", "particle.create", "material.load", "particleEffect.attach" },
-            "Hold G for the impact view and allow the layered explosion visuals.", true
+            "Hold G for the impact view and allow the muzzle and impact particles.", true
         )
         if ok then permissionSetup = true end
     end
@@ -557,14 +538,18 @@ if CLIENT then
         if ok and down then return true end
     end)
 
+    local impactCameraOffset = Vector(0, 0, IMPACT_CAMERA_HEIGHT)
+    local impactCameraAngles = Angle(90, 0, 0)
     hook.add("calcview", "arty_impact_camera", function(pos, ang, fov)
         if not impactCameraHeld() then return end
-        -- Use a normal perspective CalcView here; ortho/clipping overrides can render black in-game.
+        -- Use a tight perspective view and clip distant geometry to keep the live scene light.
         return {
-            origin = predictPos + Vector(0, 0, IMPACT_CAMERA_HEIGHT),
-            angles = Angle(90, 0, 0),
+            origin = predictPos + impactCameraOffset,
+            angles = impactCameraAngles,
             fov = IMPACT_CAMERA_FOV,
-            drawviewer = true
+            znear = IMPACT_CAMERA_ZNEAR,
+            zfar = IMPACT_CAMERA_ZFAR,
+            drawviewer = false
         }
     end)
 
@@ -601,7 +586,13 @@ if CLIENT then
         end
         updateMarker()
     end)
-    hook.add("think", "arty_marker", updateMarker)
+    local nextMarkerUpdate = 0
+    hook.add("think", "arty_marker", function()
+        local now = timer.realtime()
+        if now < nextMarkerUpdate then return end
+        nextMarkerUpdate = now + PREDICT_RATE
+        updateMarker()
+    end)
 
     -- No render-target inset: the actual game view is switched only while G is held.
     hook.add("drawhud", "arty_hud", function()
@@ -673,6 +664,8 @@ if CLIENT then
             end
         end)
         local pos = net.readVector()
+        local dir = net.readVector()
+        pcall(muzzleFlashFx, pos, dir)
         pcall(playEvent, "shot", pos)
     end)
 
