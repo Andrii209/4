@@ -1,0 +1,457 @@
+--@name M777
+--@shared
+
+-- ############################################################
+-- #  :    . "" =  .
+-- ############################################################
+local SOUND_SHOT     = "https://www.dropbox.com/scl/fi/ivzmg6r1nzrdth0ugnutp/203mm_m47_shot-001.wav?rlkey=07kbftdhy9ux4qn7fy4amgehg&st=zn4yi5c0&dl=1"
+local SOUND_SHOT_FAR = "https://www.dropbox.com/scl/fi/7r6pzf4nlyfffrop2nfmf/203mm_m47_far-001.wav?rlkey=tolulz7b0i7c9gohdb7xk7mjl&st=a453ihhu&dl=1"
+local SOUND_BOOM     = "https://www.dropbox.com/scl/fi/oha084wpguy7ydmujgdhz/bobm_explosion_05_s.wav?rlkey=vg6v2kj09lfjq8xpq5giq6lrj&st=5sgnnx6o&dl=1"
+
+local WHISTLE_PATH  = "weapons/rpg/rocket1.wav"
+local WHISTLE_VOL   = 0.9
+local WHISTLE_LEVEL = 90
+
+local NEAR_DIST       = 2000
+local FAR_SHOT_VOL    = 2.5
+local FAR_SHOT_OFFSET = 900
+local SOUND_SPEED     = 18000
+local SOUND_DEBUG     = false
+
+-- ####################  ####################
+local DAMAGE = 150
+local RADIUS = 600
+local DAMAGE_DEBUG = false
+
+-- ####################   (   ) ####################
+local MARKER_MODEL = "models/hunter/tubes/tube2x2x025.mdl"
+local MARKER_COLOR = Color(0, 255, 0, 150)
+local PREDICT_RATE = 0.2   --     ()
+
+-- =====================  =====================
+local MODEL      = "models/props_junk/propane_tank001a.mdl"
+local MODEL_ANG  = Angle(90, 0, 0)
+local SPEED      = 2500
+local ELEVATION  = 45
+local GRAVITY    = 600
+local MUZZLE_OFF = 70
+local FIRE_DELAY = 1.5
+local MAX_FLIGHT = 20
+
+local TRAIL_MAT   = "trails/laser"
+local TRAIL_COLOR = Color(255, 180, 80)
+local TRAIL_START = 14
+local TRAIL_END   = 2
+local TRAIL_LIFE  = 0.7
+
+local BOOM_SCALE = 20
+local BOOM_FX    = { "explosion_huge", "explosion_huge_b", "building_explosion", "generic_smoke" }
+local SMOKE_FX   = "smoke_trail"
+local ANCHOR_MODEL = "models/hunter/blocks/cube025x025x025.mdl"
+
+local MB_SMOKE_N    = 26
+local MB_SMOKE_SPD  = 620
+local MB_SMOKE_FWD  = 320
+local MB_SMOKE_SIZE = 240
+local MB_FLAME_N    = 24
+local MB_FLAME_SPD  = 1500
+local MB_FLAME_LIFE = 0.30
+
+-- =====================  =====================
+if SERVER then
+    wire.adjustInputs(
+        {"Fire","Elevation","Speed","Damage","Radius","Cooldown"},
+        {"number","number","number","number","number","number"}
+    )
+    local shells, shotId, lastFire = {}, 0, 0
+    local lastThink = timer.curtime()
+    local lastPredict = 0
+
+    local function getDamage()   return wire.ports.Damage ~= 0 and wire.ports.Damage or DAMAGE end
+    local function getRadius()   return wire.ports.Radius ~= 0 and wire.ports.Radius or RADIUS end
+    local function getCooldown() return math.max(0, wire.ports.Cooldown ~= 0 and wire.ports.Cooldown or FIRE_DELAY) end
+
+    --  :    
+    local function fireParams()
+        local elev  = wire.ports.Elevation ~= 0 and wire.ports.Elevation or ELEVATION
+        local speed = wire.ports.Speed     ~= 0 and wire.ports.Speed     or SPEED
+        local c   = chip()
+        local fwd = c:getForward()                 --  
+        local rad = math.rad(elev)
+        local dir = fwd * math.cos(rad) + Vector(0,0,1) * math.sin(rad)
+        dir = dir / dir:getLength()
+        local pos = c:getPos() + fwd * MUZZLE_OFF + Vector(0,0,8)
+        return pos, dir, speed
+    end
+
+    local function shellAng(dir)
+        local a = dir:getAngle()
+        return Angle(a.p+MODEL_ANG.p, a.y+MODEL_ANG.y, a.r+MODEL_ANG.r)
+    end
+
+    local function predictImpact(pos, dir, speed)
+        local p, v = pos, dir * speed
+        local dt = 0.05
+        for i = 1, 600 do
+            v = v - Vector(0,0,GRAVITY*dt)
+            local np = p + v*dt
+            local tr = trace.line(p, np, { chip(), owner() })
+            if tr.Hit then return tr.HitPos end
+            p = np
+        end
+        return p
+    end
+
+    local function applyBlastDamage(pos)
+        local radius, damage = getRadius(), getDamage()
+        local ok, list = pcall(find.inSphere, pos, radius)
+        if not ok then return end
+        for _, e in ipairs(list) do
+            if e:isValid() then
+                local cls = e:getClass()
+                local isTarget = e:isPlayer() or e:isNPC()
+                    or cls == "gmod_wire_explosive" or cls == "prop_physics"
+                if isTarget then
+                    local d = (e:getPos() - pos):getLength()
+                    local dmg = damage * math.max(0, 1 - d / radius)
+                    if dmg > 1 then
+                        pcall(function() e:applyDamage(dmg, owner(), chip(), 64, pos) end)
+                        if cls == "gmod_wire_explosive" then
+                            pcall(wire.triggerInput, e, "Detonate", 1)
+                        end
+                    end
+                end
+            end
+        end
+    end
+
+    local function explode(s, pos)
+        shells[s.id] = nil
+        s.holo:remove()
+        net.start("arty_boom")
+        net.writeUInt(s.id, 16)
+        net.writeVector(pos)
+        net.send()
+        effect.create("Explosion", { origin = pos, scale = BOOM_SCALE })
+        effect.create("HelicopterMegaBomb", { origin = pos })
+        effect.beamRingPoint(pos, 0.5, 20, getRadius(), 24, 6, Color(255, 200, 120))
+        pcall(applyBlastDamage, pos)
+    end
+
+    local function fire()
+        local t = timer.curtime()
+        if t - lastFire < getCooldown() then return end
+        lastFire = t
+        local pos, dir, speed = fireParams()
+        local holo = hologram.create(pos, shellAng(dir), MODEL)
+        if not holo then return end
+        holo:setTrails(TRAIL_START, TRAIL_END, TRAIL_LIFE, TRAIL_MAT, TRAIL_COLOR, nil, true)
+        shotId = (shotId + 1) % 65536
+        shells[shotId] = { id = shotId, holo = holo, pos = pos, vel = dir * speed, born = t }
+        net.start("arty_fire")
+        net.writeUInt(shotId, 16)
+        net.writeEntity(holo)
+        net.writeVector(pos)
+        net.writeVector(dir)
+        net.send()
+    end
+
+    hook.add("think", "arty", function()
+        local t = timer.curtime()
+        local dt = math.min(t - lastThink, 0.1)
+        lastThink = t
+
+        --     
+        local ow = owner()
+        if ow and ow:isValid() and ow:inVehicle() and t - lastPredict > PREDICT_RATE then
+            lastPredict = t
+            local pos, dir, speed = fireParams()
+            local impact = predictImpact(pos, dir, speed)
+            net.start("arty_predict")
+            net.writeVector(impact)
+            net.send(ow)
+        end
+
+        if dt <= 0 then return end
+        for _, s in pairs(shells) do
+            s.vel = s.vel - Vector(0, 0, GRAVITY * dt)
+            local np = s.pos + s.vel * dt
+            local tr = trace.line(s.pos, np, { chip(), owner() })
+            if tr.Hit or t - s.born > MAX_FLIGHT then
+                explode(s, tr.Hit and tr.HitPos or np)
+            else
+                s.pos = np
+                s.holo:setPos(np)
+                s.holo:setAngles(shellAng(s.vel))
+            end
+        end
+    end)
+
+    hook.add("input", "arty", function(n, v) if n == "Fire" and v > 0 then fire() end end)
+    hook.add("playersay", "arty", function(ply, text)
+        if ply ~= owner() then return end
+        if text ~= "!fire" and text:sub(1, 6) ~= "!fire " then return end
+        fire()
+        return ""
+    end)
+    print("M777: !fire /  Fire |    ")
+end
+
+-- =====================  =====================
+if CLIENT then
+    local fxSet
+    local function pickFx(cands)
+        if not fxSet or next(fxSet) == nil then
+            fxSet = {}
+            for _, n in ipairs(particleEffect.getList()) do fxSet[n] = true end
+        end
+        for _, n in ipairs(cands) do if fxSet[n] then return n end end
+        return nil
+    end
+
+    local function anchor(pos, ang)
+        local h = hologram.create(pos, ang or Angle(0,0,0), ANCHOR_MODEL)
+        if h then h:setColor(Color(255,255,255,0)) end
+        return h
+    end
+    local function attach(h, name)
+        if not h or not name then return nil end
+        local ok, fx = pcall(particleEffect.attach, h, name, 1)
+        if ok then return fx end
+        return nil
+    end
+
+    local function muzzleBlast(pos, dir)
+        local now   = timer.curtime()
+        local ang   = dir:getAngle()
+        local right = ang:getRight()
+        local up    = ang:getUp()
+        local em = particle.create(pos, true)
+        if not em then return end
+
+        for i = 1, MB_SMOKE_N do
+            local side = (i % 2 == 0) and 1 or -1
+            local vel = right * (side * math.random(220, MB_SMOKE_SPD))
+                      + dir * math.random(60, MB_SMOKE_FWD)
+                      + up  * math.random(20, 120)
+            local p = em:add("particle/particle_smokegrenade", pos + dir * math.random(0, 30))
+            if p then
+                p:setVelocity(vel)
+                p:setDieTime(now + math.random(14, 24) / 10)
+                p:setStartAlpha(math.random(170, 225))
+                p:setEndAlpha(0)
+                p:setStartSize(math.random(24, 44))
+                p:setEndSize(math.random(MB_SMOKE_SIZE * 0.6, MB_SMOKE_SIZE))
+                p:setGravity(Vector(0, 0, math.random(20, 60)))
+                p:setAirResistance(math.random(15, 30) / 10)
+                p:setColor(Color(35, 32, 30))
+            end
+        end
+
+        for i = 1, MB_FLAME_N do
+            local spread = right * math.random(-90, 90) + up * math.random(-90, 90)
+            local vel = dir * math.random(MB_FLAME_SPD * 0.5, MB_FLAME_SPD) + spread
+            local p = em:add("sprites/flamelet" .. math.random(1, 5), pos + dir * math.random(0, 20))
+            if p then
+                p:setVelocity(vel)
+                p:setDieTime(now + math.random(10, MB_FLAME_LIFE * 100) / 100)
+                p:setStartAlpha(255)
+                p:setEndAlpha(0)
+                p:setStartSize(math.random(30, 60))
+                p:setEndSize(math.random(70, 130))
+                p:setAirResistance(2)
+                p:setColor(Color(255, math.random(140, 210), 40))
+            end
+        end
+
+        for i = 1, 5 do
+            local p = em:add("sprites/flamelet1", pos + dir * 10)
+            if p then
+                p:setVelocity(dir * 200)
+                p:setDieTime(now + 0.12)
+                p:setStartAlpha(255)
+                p:setEndAlpha(0)
+                p:setStartSize(90)
+                p:setEndSize(170)
+                p:setColor(Color(255, 230, 170))
+            end
+        end
+
+        em:finish()
+        timer.simple(3, function() pcall(function() em:destroy() end) end)
+    end
+
+    -- =====  =====
+    local pools = {}
+    local function initPool(key, url, fmin, fmax, simple, vol)
+        local p = { chans = {}, idx = 0 }
+        pools[key] = p
+        if url == "" then return end
+        for i = 1, 2 do
+            local ok, err = pcall(bass.loadURL, url, "3d noblock noplay", function(snd, e)
+                if snd and snd:isValid() then
+                    snd:setFade(fmin, fmax, simple)
+                    snd:setVolume(vol)
+                    p.chans[#p.chans + 1] = snd
+                else
+                    print("   (" .. key .. "): " .. tostring(e))
+                end
+            end)
+            if not ok then print("bass (" .. key .. "): " .. tostring(err)) end
+        end
+    end
+    initPool("shot_near", SOUND_SHOT,     400, NEAR_DIST, true, 1)
+    initPool("shot_far",  SOUND_SHOT_FAR, 300, 6000, true, FAR_SHOT_VOL)
+    initPool("boom",      SOUND_BOOM,     400, 200000, false, 1.5)
+
+    local function engineFallback(kind, far, pos)
+        if kind == "boom" then
+            sound.emitSound("weapons/explode" .. math.random(3,5) .. ".wav", pos, 140, 80, 1)
+        else
+            sound.emitSound("weapons/rpg/rocketfire1.wav", pos, far and 140 or 90, far and 65 or 100, 1)
+        end
+    end
+
+    local function playEvent(kind, pos)
+        local lp = player()
+        if not (lp and lp:isValid()) then lp = owner() end
+        local lpPos = (lp and lp:isValid()) and lp:getPos() or pos
+        local dist = (lpPos - pos):getLength()
+        local key, far, delay, sndPos = "boom", false, 0, pos
+        if kind ~= "boom" then
+            far = dist > NEAR_DIST
+            key = far and "shot_far" or "shot_near"
+            delay = far and dist / SOUND_SPEED or 0
+            if far then
+                local d = pos - lpPos
+                local len = d:getLength()
+                if len > 0 then d = d / len end
+                sndPos = lpPos + d * FAR_SHOT_OFFSET
+            end
+        end
+        local function go()
+            local p = pools[key]
+            if p and #p.chans > 0 then
+                p.idx = p.idx % #p.chans + 1
+                local snd = p.chans[p.idx]
+                if snd:isValid() then
+                    snd:setPos(sndPos); snd:setTime(0); snd:play()
+                    return
+                end
+            end
+            engineFallback(kind, far, sndPos)
+        end
+        if delay > 0.02 then timer.simple(delay, go) else go() end
+    end
+
+    -- =====  =====
+    local whistleActive = {}
+    local lastW = timer.realtime()
+    hook.add("think", "arty_whistle", function()
+        local t = timer.realtime()
+        local dt = math.min(t - lastW, 0.1)
+        lastW = t
+        if dt <= 0 then return end
+        for id, w in pairs(whistleActive) do
+            if not w.holo:isValid() then
+                pcall(function() w.snd:stop(); w.snd:destroy() end)
+                whistleActive[id] = nil
+            else
+                local pos = w.holo:getPos()
+                local vel = (pos - w.prev) / dt
+                w.prev = pos
+                local fall = -vel.z
+                local mult = math.max(0.5, math.min(2.5, 0.7 + fall / 1200))
+                pcall(function() w.snd:setPitch(math.floor(mult * 100)) end)
+            end
+        end
+    end)
+
+    local function bigBoomFx(pos)
+        local h = anchor(pos + Vector(0,0,10))
+        local fx = attach(h, pickFx(BOOM_FX))
+        timer.simple(7, function()
+            if fx and fx:isValid() then fx:destroy() end
+            if h and h:isValid() then h:remove() end
+        end)
+    end
+
+    -- =====   (   ) =====
+    local predictPos, marker
+    local function seatedOwner()
+        local lp = player()
+        return lp and lp:isValid() and lp == owner() and lp:inVehicle()
+    end
+    local function updateMarker()
+        if predictPos and seatedOwner() then
+            if not marker or not marker:isValid() then
+                marker = hologram.create(predictPos, Angle(0,0,0), MARKER_MODEL)
+                if marker then marker:setColor(MARKER_COLOR) end
+            end
+            if marker and marker:isValid() then marker:setPos(predictPos + Vector(0,0,2)) end
+        else
+            if marker and marker:isValid() then marker:remove() end
+            marker = nil
+        end
+    end
+    net.receive("arty_predict", function()
+        predictPos = net.readVector()
+        updateMarker()
+    end)
+    hook.add("think", "arty_marker", updateMarker)
+
+    --  HUD (  Starfall HUD)
+    hook.add("drawhud", "arty_hud", function()
+        if not predictPos or not seatedOwner() then return end
+        pcall(function()
+            local scr = predictPos:toScreen()
+            if scr and scr.visible then
+                render.setColor(Color(0,255,0,220))
+                render.drawRect(scr.x-14, scr.y-2, 28, 4)
+                render.drawRect(scr.x-2, scr.y-14, 4, 28)
+                local m = math.floor((player():getPos()-predictPos):getLength() / 52.5)
+                render.drawSimpleText(scr.x+16, scr.y-8, m .. " m", 0, 0)
+            end
+        end)
+    end)
+
+    local trails, dead = {}, {}
+    net.receive("arty_fire", function()
+        local id = net.readUInt(16)
+        net.readEntity(function(holo)
+            if not holo or dead[id] then return end
+            local ok, fx = pcall(particleEffect.attach, holo, SMOKE_FX, 1)
+            if ok then trails[id] = fx end
+            local ok2, ws = pcall(sound.create, holo, WHISTLE_PATH)
+            if ok2 and ws then
+                pcall(function()
+                    ws:setSoundLevel(WHISTLE_LEVEL)
+                    ws:setVolume(WHISTLE_VOL)
+                    ws:play()
+                end)
+                whistleActive[id] = { snd = ws, holo = holo, prev = holo:getPos() }
+            end
+        end)
+        local pos = net.readVector()
+        local dir = net.readVector()
+        local ok, err = pcall(muzzleBlast, pos, dir)
+        if not ok then print("muzzleBlast: " .. tostring(err)) end
+        pcall(playEvent, "shot", pos)
+    end)
+
+    net.receive("arty_boom", function()
+        local id = net.readUInt(16)
+        local pos = net.readVector()
+        dead[id] = true
+        timer.simple(10, function() dead[id] = nil end)
+        local fx = trails[id]; trails[id] = nil
+        if fx and fx:isValid() then
+            fx:stopEmission()
+            timer.simple(4, function() if fx:isValid() then fx:destroy() end end)
+        end
+        local w = whistleActive[id]; whistleActive[id] = nil
+        if w then pcall(function() w.snd:stop(); w.snd:destroy() end) end
+        pcall(bigBoomFx, pos)
+        pcall(playEvent, "boom", pos)
+    end)
+end
