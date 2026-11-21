@@ -49,7 +49,21 @@ local BOOM_FX    = { "explosion_huge", "explosion_huge_b", "building_explosion",
 local SMOKE_FX   = "smoke_trail"
 local ANCHOR_MODEL = "models/hunter/blocks/cube025x025x025.mdl"
 
-local MUZZLE_SMOKE_LIFE = 2.5
+local MUZZLE_SMOKE_LIFE = 2.8
+local MUZZLE_FLASH_LIFE = 0.4
+local MUZZLE_SMOKE_COUNT = 30
+local MUZZLE_FIRE_COUNT = 22
+local MUZZLE_FIRE_FX = {
+    "gunship_muzzle_flash", "muzzleflash_1", "muzzleflash_rifle",
+    "muzzleflash_shotgun", "muzzleflash_smg1", "cannon_muzzle_flash"
+}
+local MUZZLE_SMOKE_FX = { "generic_smoke", "smokegrenade", SMOKE_FX }
+
+local TOPDOWN_RT = "arty_topdown_impact"
+local TOPDOWN_RT_SIZE = 256
+local TOPDOWN_CAMERA_HEIGHT = 4000
+local TOPDOWN_CAMERA_SPAN = 2000
+local TOPDOWN_UPDATE_RATE = 0.25
 
 -- =====================  =====================
 if SERVER then
@@ -214,6 +228,18 @@ if CLIENT then
         for _, n in ipairs(cands) do if fxSet[n] then return n end end
         return nil
     end
+    local function pickMuzzleFireFx()
+        local name = pickFx(MUZZLE_FIRE_FX)
+        if name then return name end
+        for _, candidate in ipairs(particleEffect.getList()) do
+            local lower = string.lower(candidate)
+            if string.find(lower, "muzzle", 1, true)
+                and (string.find(lower, "flash", 1, true) or string.find(lower, "fire", 1, true)) then
+                return candidate
+            end
+        end
+        return nil
+    end
 
     local function anchor(pos, ang)
         local h = hologram.create(pos, ang or Angle(0,0,0), ANCHOR_MODEL)
@@ -221,22 +247,100 @@ if CLIENT then
         return h
     end
     local function attach(h, name)
-        if not h or not name then return nil end
+        if not h or not name or not hasPermission("particleEffect.attach") then return nil end
         local ok, fx = pcall(particleEffect.attach, h, name, 1)
         if ok then return fx end
         return nil
     end
 
-    local function muzzleBlast(pos, dir)
-        local h = anchor(pos, dir:getAngle())
-        if not h then return end
+    local muzzleMaterials = {}
+    local function loadMuzzleMaterial(path)
+        if muzzleMaterials[path] then return muzzleMaterials[path] end
+        local ok, mat = pcall(material.load, path)
+        if ok and mat then muzzleMaterials[path] = mat end
+        return ok and mat or nil
+    end
 
-        -- A short-lived attached particle effect makes a visible smoke puff at the muzzle.
-        local fx = attach(h, pickFx({ SMOKE_FX, "generic_smoke" }))
-        timer.simple(MUZZLE_SMOKE_LIFE, function()
-            if fx and fx:isValid() then fx:destroy() end
-            if h and h:isValid() then h:remove() end
+    local function addMuzzleParticle(em, mat, pos, startSize, endSize, startAlpha, life, velocity, gravity, air, color)
+        if not mat then return false end
+        local ok, spawned = pcall(function()
+            local p = em:add(mat, pos, startSize, endSize, 0, 0, startAlpha, 0, life)
+            if not p then return false end
+            p:setVelocity(velocity)
+            p:setGravity(gravity)
+            p:setAirResistance(air)
+            p:setColor(color)
+            return true
         end)
+        return ok and spawned == true
+    end
+
+    local function muzzleBlast(pos, dir)
+        local ang = dir:getAngle()
+        local right = ang:getRight()
+        local smokeMat = hasPermission("material.load", "particle/particle_smokegrenade")
+            and loadMuzzleMaterial("particle/particle_smokegrenade") or nil
+        local flameMat = hasPermission("material.load", "sprites/flamelet1")
+            and loadMuzzleMaterial("sprites/flamelet1") or nil
+        local em
+        if (smokeMat or flameMat) and hasPermission("particle.create") then
+            local emitterOK, created = pcall(particle.create, pos, true)
+            if emitterOK then em = created end
+        end
+
+        local madeSmoke, madeFire = false, false
+        if em and smokeMat then
+            for i = 1, MUZZLE_SMOKE_COUNT do
+                local life = math.random(24, 36) / 10
+                local vel = right * math.random(-220, 220)
+                          + dir * math.random(30, 220)
+                          + Vector(0, 0, math.random(55, 180))
+                if addMuzzleParticle(em, smokeMat, pos + dir * math.random(0, 18),
+                    math.random(32, 56), math.random(190, 320), math.random(175, 225), life,
+                    vel, Vector(0, 0, math.random(20, 55)), math.random(18, 32) / 10,
+                    Color(115, 110, 105)) then
+                    madeSmoke = true
+                end
+            end
+        end
+
+        if em and flameMat then
+            for i = 1, MUZZLE_FIRE_COUNT do
+                local life = math.random(12, 26) / 100
+                local spread = right * math.random(-90, 90) + Vector(0, 0, math.random(-70, 100))
+                local vel = dir * math.random(650, 1450) + spread
+                if addMuzzleParticle(em, flameMat, pos + dir * math.random(0, 16),
+                    math.random(28, 48), math.random(75, 145), 255, life,
+                    vel, Vector(0, 0, math.random(20, 100)), 2.4,
+                    Color(255, math.random(95, 190), 35)) then
+                    madeFire = true
+                end
+            end
+            for i = 1, 5 do
+                if addMuzzleParticle(em, flameMat, pos + dir * 10, 90, 160, 255, 0.12,
+                    dir * 260, Vector(0, 0, 35), 1.5, Color(255, 225, 145)) then
+                    madeFire = true
+                end
+            end
+        end
+        if em then pcall(function() em:destroy() end) end
+
+        -- Use installed particle systems if custom sprite materials are unavailable.
+        local fireFx, smokeFx, h
+        if not madeFire or not madeSmoke then
+            h = anchor(pos, ang)
+            if h then
+                if not madeFire then fireFx = attach(h, pickMuzzleFireFx()) end
+                if not madeSmoke then smokeFx = attach(h, pickFx(MUZZLE_SMOKE_FX)) end
+                timer.simple(MUZZLE_FLASH_LIFE, function()
+                    if fireFx and fireFx:isValid() then fireFx:destroy() end
+                end)
+                timer.simple(MUZZLE_SMOKE_LIFE, function()
+                    if smokeFx and smokeFx:isValid() then smokeFx:destroy() end
+                    if h and h:isValid() then h:remove() end
+                end)
+            end
+        end
     end
 
     -- =====  =====
@@ -340,11 +444,46 @@ if CLIENT then
         local lp = player()
         return lp and lp:isValid() and lp == owner() and lp:inVehicle()
     end
+
+    local lp = player()
+    local ownerClient = lp and lp:isValid() and lp == owner()
+    local topDownRTReady, topDownFrameReady = false, false
+    local cameraPromptSent, lastPermissionTry, lastTopDownRender = false, 0, 0
+    if ownerClient then
+        pcall(setupPermissionRequest,
+            { "render.renderscene", "render.renderView", "material.load", "particle.create", "particleEffect.attach" },
+            "Show the live impact camera and artillery fire/smoke effects.", true
+        )
+        topDownRTReady = pcall(render.createRenderTarget, TOPDOWN_RT)
+    end
+
+    local function hasTopDownCameraPermission()
+        return ownerClient and topDownRTReady
+            and hasPermission("render.renderscene")
+            and hasPermission("render.renderView")
+    end
+    local function hasMuzzleParticlePermissions()
+        return hasPermission("particle.create")
+            and hasPermission("material.load", "particle/particle_smokegrenade")
+            and hasPermission("material.load", "sprites/flamelet1")
+    end
+
+    hook.add("think", "arty_topdown_permission", function()
+        if not ownerClient or not topDownRTReady or not seatedOwner() or cameraPromptSent then return end
+        if hasTopDownCameraPermission() and hasMuzzleParticlePermissions() then return end
+        local now = timer.realtime()
+        if now - lastPermissionTry < 1 then return end
+        lastPermissionTry = now
+        local ok = pcall(sendPermissionRequest)
+        if ok then cameraPromptSent = true end
+    end)
+
     local function updateMarker()
         local seated = seatedOwner()
         if not seated then
             trajectory = nil
             predictPos = nil
+            topDownFrameReady = false
         end
 
         if predictPos and seated then
@@ -375,78 +514,96 @@ if CLIENT then
     end)
     hook.add("think", "arty_marker", updateMarker)
 
-    local function drawTopDownMap()
+    hook.add("renderscene", "arty_topdown_scene", function()
+        if not seatedOwner() or not trajectory or not predictPos or not topDownRTReady then return end
+        if not hasTopDownCameraPermission() or render.isInRenderView() then return end
+        if render.renderViewsLeft() <= 0 then return end
+
+        local now = timer.realtime()
+        if now - lastTopDownRender < TOPDOWN_UPDATE_RATE then return end
+        lastTopDownRender = now
+
+        local target = predictPos
+        local selectedRT = false
+        local ok = pcall(function()
+            render.selectRenderTarget(TOPDOWN_RT)
+            selectedRT = true
+            render.clear(Color(12, 18, 26, 255), true, true)
+            render.renderView({
+                origin = target + Vector(0, 0, TOPDOWN_CAMERA_HEIGHT),
+                angles = Angle(90, 0, 0),
+                x = 0, y = 0, w = TOPDOWN_RT_SIZE, h = TOPDOWN_RT_SIZE,
+                aspect = 1,
+                ortho = {
+                    left = -TOPDOWN_CAMERA_SPAN, right = TOPDOWN_CAMERA_SPAN,
+                    top = TOPDOWN_CAMERA_SPAN, bottom = -TOPDOWN_CAMERA_SPAN
+                },
+                znear = 1, zfar = TOPDOWN_CAMERA_HEIGHT * 5,
+                drawviewmodel = false, drawviewer = false,
+                drawmonitors = false, dopostprocess = false
+            })
+        end)
+        if selectedRT then pcall(function() render.selectRenderTarget() end) end
+        if ok then topDownFrameReady = true end
+    end)
+
+    local function drawTopDownCamera()
         local screenW = render.getGameResolution()
-        local size = 184
-        local boxX, boxY = screenW - size - 18, 18
-        local plotSize = 132
-        local plotX = boxX + (size - plotSize) * 0.5
-        local plotY = boxY + 30
+        local boxSize, viewSize = 240, 200
+        local boxX, boxY = screenW - boxSize - 18, 18
+        local viewX = boxX + (boxSize - viewSize) * 0.5
+        local viewY = boxY + 30
+        local cameraPermission = hasTopDownCameraPermission()
 
-        render.setColor(Color(8, 14, 22, 225))
-        render.drawRect(boxX, boxY, size, size)
+        render.setColor(Color(7, 12, 19, 235))
+        render.drawRect(boxX, boxY, boxSize, boxSize)
         render.setColor(Color(115, 145, 165, 240))
-        render.drawRectOutline(boxX, boxY, size, size, 1)
-        render.setColor(Color(235, 242, 248, 255))
-        render.drawSimpleText(boxX + 10, boxY + 8, "TOP-DOWN IMPACT", 0, 0)
+        render.drawRectOutline(boxX, boxY, boxSize, boxSize, 1)
+        render.setColor(Color(238, 244, 250, 255))
+        render.drawSimpleText(boxX + 10, boxY + 7, "LIVE IMPACT CAMERA", 0, 0)
 
-        render.setColor(Color(13, 22, 30, 235))
-        render.drawRect(plotX, plotY, plotSize, plotSize)
-        render.setColor(Color(70, 92, 108, 180))
-        render.drawRectOutline(plotX, plotY, plotSize, plotSize, 1)
-        render.drawLine(plotX + plotSize * 0.5, plotY + 3, plotX + plotSize * 0.5, plotY + plotSize - 3)
-        render.drawLine(plotX + 3, plotY + plotSize * 0.5, plotX + plotSize - 3, plotY + plotSize * 0.5)
+        if cameraPermission and topDownFrameReady and trajectory and predictPos then
+            render.setColor(Color(255, 255, 255, 255))
+            render.setRenderTargetTexture(TOPDOWN_RT)
+            render.drawTexturedRectUV(viewX, viewY, viewSize, viewSize, 0, 0, 0.25, 0.25)
+            render.setRenderTargetTexture(nil)
 
-        if not trajectory or #trajectory < 2 then
-            render.setColor(Color(190, 200, 210, 230))
-            render.drawSimpleText(boxX + 10, boxY + size - 15, "WAITING FOR AIM", 0, 0)
-            return
+            local centerX, centerY = viewX + viewSize * 0.5, viewY + viewSize * 0.5
+            render.setColor(Color(255, 58, 48, 255))
+            render.drawLine(centerX - 10, centerY, centerX + 10, centerY)
+            render.drawLine(centerX, centerY - 10, centerX, centerY + 10)
+            render.drawCircle(centerX, centerY, 6)
+        else
+            render.setColor(Color(12, 18, 26, 255))
+            render.drawRect(viewX, viewY, viewSize, viewSize)
+            render.setColor(Color(225, 232, 240, 255))
+            local status = "CAMERA LOADING"
+            if not topDownRTReady then
+                status = "CAMERA UNAVAILABLE"
+            elseif not cameraPermission then
+                status = "ALLOW CAMERA"
+            elseif not trajectory or not predictPos then
+                status = "WAITING FOR AIM"
+            end
+            render.drawSimpleText(viewX + viewSize * 0.5, viewY + viewSize * 0.5, status, 1, 1)
         end
 
-        local first = trajectory[1]
-        local minX, maxX = first.x, first.x
-        local minY, maxY = first.y, first.y
-        for i = 2, #trajectory do
-            local p = trajectory[i]
-            minX, maxX = math.min(minX, p.x), math.max(maxX, p.x)
-            minY, maxY = math.min(minY, p.y), math.max(maxY, p.y)
+        render.setColor(Color(115, 145, 165, 240))
+        render.drawRectOutline(viewX, viewY, viewSize, viewSize, 1)
+        if trajectory and #trajectory >= 2 then
+            local first, impact = trajectory[1], trajectory[#trajectory]
+            local dx, dy = impact.x - first.x, impact.y - first.y
+            local rangeMeters = math.floor(math.sqrt(dx * dx + dy * dy) / 52.5)
+            render.setColor(Color(238, 244, 250, 255))
+            render.drawSimpleText(boxX + 10, boxY + boxSize - 17, "RANGE " .. rangeMeters .. " m", 0, 0)
         end
-
-        local centerX = (minX + maxX) * 0.5
-        local centerY = (minY + maxY) * 0.5
-        local worldSpan = math.max(maxX - minX, maxY - minY, 512) * 1.25
-        local scale = plotSize / worldSpan
-        local function mapPoint(p)
-            return plotX + plotSize * 0.5 + (p.x - centerX) * scale,
-                   plotY + plotSize * 0.5 - (p.y - centerY) * scale
-        end
-
-        render.setColor(Color(255, 178, 66, 235))
-        for i = 1, #trajectory - 1 do
-            local x1, y1 = mapPoint(trajectory[i])
-            local x2, y2 = mapPoint(trajectory[i + 1])
-            render.drawLine(x1, y1, x2, y2)
-        end
-
-        local startX, startY = mapPoint(first)
-        local impact = trajectory[#trajectory]
-        local impactX, impactY = mapPoint(impact)
-        render.setColor(Color(80, 205, 255, 255))
-        render.drawRect(startX - 3, startY - 3, 6, 6)
-        render.setColor(Color(255, 72, 64, 255))
-        render.drawRect(impactX - 4, impactY - 4, 8, 8)
-
-        local dx, dy = impact.x - first.x, impact.y - first.y
-        local rangeMeters = math.floor(math.sqrt(dx * dx + dy * dy) / 52.5)
-        render.setColor(Color(235, 242, 248, 255))
-        render.drawSimpleText(boxX + 10, boxY + size - 15, "RANGE " .. rangeMeters .. " m", 0, 0)
     end
 
-    -- Draw the trajectory and top-down impact panel only on the seated owner's HUD.
+    -- The inset is a real orthographic world render from above, centered on the predicted impact.
     hook.add("drawhud", "arty_hud", function()
         if not seatedOwner() then return end
         pcall(function()
-            drawTopDownMap()
+            drawTopDownCamera()
             if not trajectory or #trajectory < 2 or not predictPos then return end
 
             render.setColor(Color(255,190,70,220))
