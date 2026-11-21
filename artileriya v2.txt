@@ -44,26 +44,16 @@ local TRAIL_START = 14
 local TRAIL_END   = 2
 local TRAIL_LIFE  = 0.7
 
-local BOOM_SCALE = 20
+local BOOM_SCALE = 40
 local BOOM_FX    = { "explosion_huge", "explosion_huge_b", "building_explosion", "generic_smoke" }
 local SMOKE_FX   = "smoke_trail"
 local ANCHOR_MODEL = "models/hunter/blocks/cube025x025x025.mdl"
-
-local MUZZLE_SMOKE_LIFE = 2.8
-local MUZZLE_FLASH_LIFE = 0.4
-local MUZZLE_SMOKE_COUNT = 30
-local MUZZLE_FIRE_COUNT = 22
-local MUZZLE_FIRE_FX = {
-    "gunship_muzzle_flash", "muzzleflash_1", "muzzleflash_rifle",
-    "muzzleflash_shotgun", "muzzleflash_smg1", "cannon_muzzle_flash"
-}
-local MUZZLE_SMOKE_FX = { "generic_smoke", "smokegrenade", SMOKE_FX }
-
-local TOPDOWN_RT = "arty_topdown_impact"
-local TOPDOWN_RT_SIZE = 256
-local TOPDOWN_CAMERA_HEIGHT = 4000
-local TOPDOWN_CAMERA_SPAN = 2000
-local TOPDOWN_UPDATE_RATE = 0.25
+local MUZZLE_3D_MODEL = "models/hunter/misc/sphere025x025.mdl"
+local MUZZLE_MATERIAL = "models/debug/debugwhite"
+local IMPACT_CAMERA_HEIGHT = 3500
+local IMPACT_CAMERA_SPAN = 1800
+local DAMAGE_LIMIT = 10000
+local RADIUS_LIMIT = 10000
 
 -- =====================  =====================
 if SERVER then
@@ -76,8 +66,17 @@ if SERVER then
     local lastThink = timer.curtime()
     local lastPredict = 0
 
-    local function getDamage()   return wire.ports.Damage ~= 0 and wire.ports.Damage or DAMAGE end
-    local function getRadius()   return wire.ports.Radius ~= 0 and wire.ports.Radius or RADIUS end
+    -- Connect Wire inputs Damage and Radius to customize the blast; 0 keeps the defaults above.
+    local function getDamage()
+        local value = wire.ports.Damage
+        if value == 0 then return DAMAGE end
+        return math.max(0, math.min(value, DAMAGE_LIMIT))
+    end
+    local function getRadius()
+        local value = wire.ports.Radius
+        if value == 0 then return RADIUS end
+        return math.max(1, math.min(value, RADIUS_LIMIT))
+    end
     local function getCooldown() return math.max(0, wire.ports.Cooldown ~= 0 and wire.ports.Cooldown or FIRE_DELAY) end
 
     --  :    
@@ -119,8 +118,80 @@ if SERVER then
         return points
     end
 
+    -- These are short-lived, networked hologram meshes, so the muzzle burst has real 3D volume.
+    local muzzleOrbs, lastMuzzleFxUpdate = {}, 0
+    local function createMuzzleOrb(pos, ang, velocity, scale, color, life, growth, lift)
+        local ok, h = pcall(hologram.create, pos, ang, MUZZLE_3D_MODEL, scale)
+        if not ok or not h then return end
+
+        pcall(function() h:setMaterial(MUZZLE_MATERIAL) end)
+        pcall(function() h:suppressEngineLighting(true) end)
+        pcall(function() h:setColor(color) end)
+
+        muzzleOrbs[#muzzleOrbs + 1] = {
+            holo = h, origin = pos, velocity = velocity,
+            acceleration = Vector(0, 0, lift), scale = scale,
+            color = color, life = life, growth = growth, born = timer.curtime()
+        }
+    end
+
+    local function updateMuzzleOrbs(now)
+        if now - lastMuzzleFxUpdate < 0.05 then return end
+        lastMuzzleFxUpdate = now
+        for i = #muzzleOrbs, 1, -1 do
+            local fx = muzzleOrbs[i]
+            local age = now - fx.born
+            if age >= fx.life or not fx.holo:isValid() then
+                if fx.holo:isValid() then pcall(function() fx.holo:remove() end) end
+                table.remove(muzzleOrbs, i)
+            else
+                local t = age / fx.life
+                local scaleFactor = 1 + (fx.growth - 1) * t
+                local alpha = math.floor(fx.color.a * (1 - t) * (1 - t))
+                pcall(function()
+                    fx.holo:setPos(fx.origin + fx.velocity * age + fx.acceleration * (0.5 * age * age))
+                    fx.holo:setScale(fx.scale * scaleFactor)
+                    fx.holo:setColor(Color(fx.color.r, fx.color.g, fx.color.b, alpha))
+                end)
+            end
+        end
+    end
+
+    local function spawnMuzzle3DFx(pos, dir)
+        local ang = dir:getAngle()
+        local right = ang:getRight()
+        local up = Vector(0, 0, 1)
+        local origin = pos + dir * 14
+
+        createMuzzleOrb(origin, ang, dir * 100, Vector(5.0, 3.0, 3.0),
+            Color(255, 225, 135, 250), 0.14, 0.12, 0)
+
+        for i = 1, 5 do
+            local offset = right * math.random(-24, 24) + up * math.random(-20, 20)
+            local velocity = dir * math.random(180, 430)
+                + right * math.random(-120, 120) + up * math.random(-60, 95)
+            local scale = Vector(math.random(24, 42) / 10,
+                math.random(14, 24) / 10, math.random(14, 24) / 10)
+            local color = Color(255, math.random(100, 190), math.random(24, 48), 240)
+            createMuzzleOrb(origin + offset, velocity:getAngle(), velocity, scale,
+                color, math.random(18, 32) / 100, 0.18, -80)
+        end
+
+        for i = 1, 7 do
+            local offset = right * math.random(-34, 34) + up * math.random(-14, 25)
+            local velocity = dir * math.random(20, 100)
+                + right * math.random(-55, 55) + up * math.random(45, 115)
+            local scale = Vector(math.random(22, 36) / 10,
+                math.random(22, 36) / 10, math.random(22, 36) / 10)
+            local color = Color(math.random(92, 126), math.random(88, 116), math.random(82, 108), 105)
+            createMuzzleOrb(origin + offset, Angle(0, 0, 0), velocity, scale,
+                color, math.random(18, 27) / 10, 1.9, math.random(8, 18))
+        end
+    end
+
     local function applyBlastDamage(pos)
         local radius, damage = getRadius(), getDamage()
+        if damage <= 0 then return end
         local ok, list = pcall(find.inSphere, pos, radius)
         if not ok then return end
         for _, e in ipairs(list) do
@@ -131,7 +202,7 @@ if SERVER then
                 if isTarget then
                     local d = (e:getPos() - pos):getLength()
                     local dmg = damage * math.max(0, 1 - d / radius)
-                    if dmg > 1 then
+                    if dmg > 0 then
                         pcall(function() e:applyDamage(dmg, owner(), chip(), 64, pos) end)
                         if cls == "gmod_wire_explosive" then
                             pcall(wire.triggerInput, e, "Detonate", 1)
@@ -150,8 +221,8 @@ if SERVER then
         net.writeVector(pos)
         net.send()
         effect.create("Explosion", { origin = pos, scale = BOOM_SCALE })
-        effect.create("HelicopterMegaBomb", { origin = pos })
-        effect.beamRingPoint(pos, 0.5, 20, getRadius(), 24, 6, Color(255, 200, 120))
+        effect.create("HelicopterMegaBomb", { origin = pos, scale = BOOM_SCALE })
+        effect.beamRingPoint(pos, 0.8, 30, getRadius(), 36, 8, Color(255, 200, 120))
         pcall(applyBlastDamage, pos)
     end
 
@@ -162,6 +233,7 @@ if SERVER then
         local pos, dir, speed = fireParams()
         local holo = hologram.create(pos, shellAng(dir), MODEL)
         if not holo then return end
+        pcall(spawnMuzzle3DFx, pos, dir)
         holo:setTrails(TRAIL_START, TRAIL_END, TRAIL_LIFE, TRAIL_MAT, TRAIL_COLOR, nil, true)
         shotId = (shotId + 1) % 65536
         shells[shotId] = { id = shotId, holo = holo, pos = pos, vel = dir * speed, born = t }
@@ -169,7 +241,6 @@ if SERVER then
         net.writeUInt(shotId, 16)
         net.writeEntity(holo)
         net.writeVector(pos)
-        net.writeVector(dir)
         net.send()
     end
 
@@ -177,6 +248,7 @@ if SERVER then
         local t = timer.curtime()
         local dt = math.min(t - lastThink, 0.1)
         lastThink = t
+        updateMuzzleOrbs(t)
 
         -- Send the predicted arc only to the owner, and only while they are seated.
         local ow = owner()
@@ -214,7 +286,7 @@ if SERVER then
         fire()
         return ""
     end)
-    print("M777: !fire /  Fire |    ")
+    print("M777: Fire / !fire | Wire Damage and Radius inputs (0 = defaults)")
 end
 
 -- =====================  =====================
@@ -228,19 +300,6 @@ if CLIENT then
         for _, n in ipairs(cands) do if fxSet[n] then return n end end
         return nil
     end
-    local function pickMuzzleFireFx()
-        local name = pickFx(MUZZLE_FIRE_FX)
-        if name then return name end
-        for _, candidate in ipairs(particleEffect.getList()) do
-            local lower = string.lower(candidate)
-            if string.find(lower, "muzzle", 1, true)
-                and (string.find(lower, "flash", 1, true) or string.find(lower, "fire", 1, true)) then
-                return candidate
-            end
-        end
-        return nil
-    end
-
     local function anchor(pos, ang)
         local h = hologram.create(pos, ang or Angle(0,0,0), ANCHOR_MODEL)
         if h then h:setColor(Color(255,255,255,0)) end
@@ -251,96 +310,6 @@ if CLIENT then
         local ok, fx = pcall(particleEffect.attach, h, name, 1)
         if ok then return fx end
         return nil
-    end
-
-    local muzzleMaterials = {}
-    local function loadMuzzleMaterial(path)
-        if muzzleMaterials[path] then return muzzleMaterials[path] end
-        local ok, mat = pcall(material.load, path)
-        if ok and mat then muzzleMaterials[path] = mat end
-        return ok and mat or nil
-    end
-
-    local function addMuzzleParticle(em, mat, pos, startSize, endSize, startAlpha, life, velocity, gravity, air, color)
-        if not mat then return false end
-        local ok, spawned = pcall(function()
-            local p = em:add(mat, pos, startSize, endSize, 0, 0, startAlpha, 0, life)
-            if not p then return false end
-            p:setVelocity(velocity)
-            p:setGravity(gravity)
-            p:setAirResistance(air)
-            p:setColor(color)
-            return true
-        end)
-        return ok and spawned == true
-    end
-
-    local function muzzleBlast(pos, dir)
-        local ang = dir:getAngle()
-        local right = ang:getRight()
-        local smokeMat = hasPermission("material.load", "particle/particle_smokegrenade")
-            and loadMuzzleMaterial("particle/particle_smokegrenade") or nil
-        local flameMat = hasPermission("material.load", "sprites/flamelet1")
-            and loadMuzzleMaterial("sprites/flamelet1") or nil
-        local em
-        if (smokeMat or flameMat) and hasPermission("particle.create") then
-            local emitterOK, created = pcall(particle.create, pos, true)
-            if emitterOK then em = created end
-        end
-
-        local madeSmoke, madeFire = false, false
-        if em and smokeMat then
-            for i = 1, MUZZLE_SMOKE_COUNT do
-                local life = math.random(24, 36) / 10
-                local vel = right * math.random(-220, 220)
-                          + dir * math.random(30, 220)
-                          + Vector(0, 0, math.random(55, 180))
-                if addMuzzleParticle(em, smokeMat, pos + dir * math.random(0, 18),
-                    math.random(32, 56), math.random(190, 320), math.random(175, 225), life,
-                    vel, Vector(0, 0, math.random(20, 55)), math.random(18, 32) / 10,
-                    Color(115, 110, 105)) then
-                    madeSmoke = true
-                end
-            end
-        end
-
-        if em and flameMat then
-            for i = 1, MUZZLE_FIRE_COUNT do
-                local life = math.random(12, 26) / 100
-                local spread = right * math.random(-90, 90) + Vector(0, 0, math.random(-70, 100))
-                local vel = dir * math.random(650, 1450) + spread
-                if addMuzzleParticle(em, flameMat, pos + dir * math.random(0, 16),
-                    math.random(28, 48), math.random(75, 145), 255, life,
-                    vel, Vector(0, 0, math.random(20, 100)), 2.4,
-                    Color(255, math.random(95, 190), 35)) then
-                    madeFire = true
-                end
-            end
-            for i = 1, 5 do
-                if addMuzzleParticle(em, flameMat, pos + dir * 10, 90, 160, 255, 0.12,
-                    dir * 260, Vector(0, 0, 35), 1.5, Color(255, 225, 145)) then
-                    madeFire = true
-                end
-            end
-        end
-        if em then pcall(function() em:destroy() end) end
-
-        -- Use installed particle systems if custom sprite materials are unavailable.
-        local fireFx, smokeFx, h
-        if not madeFire or not madeSmoke then
-            h = anchor(pos, ang)
-            if h then
-                if not madeFire then fireFx = attach(h, pickMuzzleFireFx()) end
-                if not madeSmoke then smokeFx = attach(h, pickFx(MUZZLE_SMOKE_FX)) end
-                timer.simple(MUZZLE_FLASH_LIFE, function()
-                    if fireFx and fireFx:isValid() then fireFx:destroy() end
-                end)
-                timer.simple(MUZZLE_SMOKE_LIFE, function()
-                    if smokeFx and smokeFx:isValid() then smokeFx:destroy() end
-                    if h and h:isValid() then h:remove() end
-                end)
-            end
-        end
     end
 
     -- =====  =====
@@ -438,39 +407,43 @@ if CLIENT then
         end)
     end
 
-    -- =====   (   ) =====
+    -- ===== Impact camera: hold G to replace the normal view with a top-down view. =====
     local trajectory, predictPos, marker
     local function seatedOwner()
         local lp = player()
         return lp and lp:isValid() and lp == owner() and lp:inVehicle()
     end
 
-    local lp = player()
-    local ownerClient = lp and lp:isValid() and lp == owner()
-    local topDownRTReady, topDownFrameReady = false, false
-    local cameraPromptSent, lastPermissionTry, lastTopDownRender = false, 0, 0
-    if ownerClient then
-        pcall(setupPermissionRequest,
-            { "render.renderscene", "render.renderView", "material.load", "particle.create", "particleEffect.attach" },
-            "Show the live impact camera and artillery fire/smoke effects.", true
+    local permissionSetup, cameraPromptSent, lastPermissionTry = false, false, 0
+    local function isOwnerClient()
+        local lp = player()
+        return lp and lp:isValid() and lp == owner()
+    end
+    local function setupImpactCameraRequest()
+        if permissionSetup or not isOwnerClient() then return end
+        local ok = pcall(setupPermissionRequest,
+            { "render.calcview", "input" },
+            "Hold G to view the predicted impact point from above.", true
         )
-        topDownRTReady = pcall(render.createRenderTarget, TOPDOWN_RT)
+        if ok then permissionSetup = true end
+    end
+    setupImpactCameraRequest()
+
+    local function hasImpactCameraPermission()
+        return permissionSetup and isOwnerClient()
+            and hasPermission("render.calcview") and hasPermission("input")
     end
 
-    local function hasTopDownCameraPermission()
-        return ownerClient and topDownRTReady
-            and hasPermission("render.renderscene")
-            and hasPermission("render.renderView")
-    end
-    local function hasMuzzleParticlePermissions()
-        return hasPermission("particle.create")
-            and hasPermission("material.load", "particle/particle_smokegrenade")
-            and hasPermission("material.load", "sprites/flamelet1")
+    local function impactCameraHeld()
+        if not hasImpactCameraPermission() or not seatedOwner() or not predictPos then return false end
+        local ok, down = pcall(input.isKeyDown, KEY.G)
+        return ok and down == true
     end
 
-    hook.add("think", "arty_topdown_permission", function()
-        if not ownerClient or not topDownRTReady or not seatedOwner() or cameraPromptSent then return end
-        if hasTopDownCameraPermission() and hasMuzzleParticlePermissions() then return end
+    hook.add("think", "arty_impact_camera_permission", function()
+        if not isOwnerClient() or not seatedOwner() then return end
+        setupImpactCameraRequest()
+        if cameraPromptSent or hasImpactCameraPermission() then return end
         local now = timer.realtime()
         if now - lastPermissionTry < 1 then return end
         lastPermissionTry = now
@@ -478,12 +451,33 @@ if CLIENT then
         if ok then cameraPromptSent = true end
     end)
 
+    hook.add("inputbindpressed", "arty_hold_g_context_menu", function(bind)
+        if bind ~= "+menu" or not isOwnerClient() or not seatedOwner() or not predictPos then return end
+        local ok, down = pcall(input.isKeyDown, KEY.G)
+        if ok and down then return true end
+    end)
+
+    hook.add("calcview", "arty_impact_camera", function(pos, ang, fov)
+        if not impactCameraHeld() then return end
+        return {
+            origin = predictPos + Vector(0, 0, IMPACT_CAMERA_HEIGHT),
+            angles = Angle(90, 0, 0),
+            fov = fov,
+            znear = 1,
+            zfar = IMPACT_CAMERA_HEIGHT * 6,
+            drawviewer = true,
+            ortho = {
+                left = -IMPACT_CAMERA_SPAN, right = IMPACT_CAMERA_SPAN,
+                top = IMPACT_CAMERA_SPAN, bottom = -IMPACT_CAMERA_SPAN
+            }
+        }
+    end)
+
     local function updateMarker()
         local seated = seatedOwner()
         if not seated then
             trajectory = nil
             predictPos = nil
-            topDownFrameReady = false
         end
 
         if predictPos and seated then
@@ -514,97 +508,37 @@ if CLIENT then
     end)
     hook.add("think", "arty_marker", updateMarker)
 
-    hook.add("renderscene", "arty_topdown_scene", function()
-        if not seatedOwner() or not trajectory or not predictPos or not topDownRTReady then return end
-        if not hasTopDownCameraPermission() or render.isInRenderView() then return end
-        if render.renderViewsLeft() <= 0 then return end
-
-        local now = timer.realtime()
-        if now - lastTopDownRender < TOPDOWN_UPDATE_RATE then return end
-        lastTopDownRender = now
-
-        local target = predictPos
-        local selectedRT = false
-        local ok = pcall(function()
-            render.selectRenderTarget(TOPDOWN_RT)
-            selectedRT = true
-            render.clear(Color(12, 18, 26, 255), true, true)
-            render.renderView({
-                origin = target + Vector(0, 0, TOPDOWN_CAMERA_HEIGHT),
-                angles = Angle(90, 0, 0),
-                x = 0, y = 0, w = TOPDOWN_RT_SIZE, h = TOPDOWN_RT_SIZE,
-                aspect = 1,
-                ortho = {
-                    left = -TOPDOWN_CAMERA_SPAN, right = TOPDOWN_CAMERA_SPAN,
-                    top = TOPDOWN_CAMERA_SPAN, bottom = -TOPDOWN_CAMERA_SPAN
-                },
-                znear = 1, zfar = TOPDOWN_CAMERA_HEIGHT * 5,
-                drawviewmodel = false, drawviewer = false,
-                drawmonitors = false, dopostprocess = false
-            })
-        end)
-        if selectedRT then pcall(function() render.selectRenderTarget() end) end
-        if ok then topDownFrameReady = true end
-    end)
-
-    local function drawTopDownCamera()
-        local screenW = render.getGameResolution()
-        local boxSize, viewSize = 240, 200
-        local boxX, boxY = screenW - boxSize - 18, 18
-        local viewX = boxX + (boxSize - viewSize) * 0.5
-        local viewY = boxY + 30
-        local cameraPermission = hasTopDownCameraPermission()
-
-        render.setColor(Color(7, 12, 19, 235))
-        render.drawRect(boxX, boxY, boxSize, boxSize)
-        render.setColor(Color(115, 145, 165, 240))
-        render.drawRectOutline(boxX, boxY, boxSize, boxSize, 1)
-        render.setColor(Color(238, 244, 250, 255))
-        render.drawSimpleText(boxX + 10, boxY + 7, "LIVE IMPACT CAMERA", 0, 0)
-
-        if cameraPermission and topDownFrameReady and trajectory and predictPos then
-            render.setColor(Color(255, 255, 255, 255))
-            render.setRenderTargetTexture(TOPDOWN_RT)
-            render.drawTexturedRectUV(viewX, viewY, viewSize, viewSize, 0, 0, 0.25, 0.25)
-            render.setRenderTargetTexture(nil)
-
-            local centerX, centerY = viewX + viewSize * 0.5, viewY + viewSize * 0.5
-            render.setColor(Color(255, 58, 48, 255))
-            render.drawLine(centerX - 10, centerY, centerX + 10, centerY)
-            render.drawLine(centerX, centerY - 10, centerX, centerY + 10)
-            render.drawCircle(centerX, centerY, 6)
-        else
-            render.setColor(Color(12, 18, 26, 255))
-            render.drawRect(viewX, viewY, viewSize, viewSize)
-            render.setColor(Color(225, 232, 240, 255))
-            local status = "CAMERA LOADING"
-            if not topDownRTReady then
-                status = "CAMERA UNAVAILABLE"
-            elseif not cameraPermission then
-                status = "ALLOW CAMERA"
-            elseif not trajectory or not predictPos then
-                status = "WAITING FOR AIM"
-            end
-            render.drawSimpleText(viewX + viewSize * 0.5, viewY + viewSize * 0.5, status, 1, 1)
-        end
-
-        render.setColor(Color(115, 145, 165, 240))
-        render.drawRectOutline(viewX, viewY, viewSize, viewSize, 1)
-        if trajectory and #trajectory >= 2 then
-            local first, impact = trajectory[1], trajectory[#trajectory]
-            local dx, dy = impact.x - first.x, impact.y - first.y
-            local rangeMeters = math.floor(math.sqrt(dx * dx + dy * dy) / 52.5)
-            render.setColor(Color(238, 244, 250, 255))
-            render.drawSimpleText(boxX + 10, boxY + boxSize - 17, "RANGE " .. rangeMeters .. " m", 0, 0)
-        end
-    end
-
-    -- The inset is a real orthographic world render from above, centered on the predicted impact.
+    -- No render-target inset: the actual game view is switched only while G is held.
     hook.add("drawhud", "arty_hud", function()
         if not seatedOwner() then return end
         pcall(function()
-            drawTopDownCamera()
+            local screenW, screenH = render.getGameResolution()
+            local cameraActive = impactCameraHeld()
+            local status = "HOLD G: IMPACT VIEW"
+            if cameraActive then
+                status = "IMPACT VIEW - RELEASE G"
+            elseif not hasImpactCameraPermission() then
+                status = "ALLOW CAMERA + INPUT"
+            elseif not predictPos then
+                status = "WAITING FOR AIM"
+            end
+            render.setColor(Color(238, 244, 250, 255))
+            render.drawSimpleText(screenW - 18, 18, status, 2, 0)
+
             if not trajectory or #trajectory < 2 or not predictPos then return end
+            local first, impact = trajectory[1], trajectory[#trajectory]
+            local dx, dy = impact.x - first.x, impact.y - first.y
+            local rangeMeters = math.floor(math.sqrt(dx * dx + dy * dy) / 52.5)
+            render.drawSimpleText(screenW - 18, 38, "RANGE " .. rangeMeters .. " m", 2, 0)
+
+            if cameraActive then
+                local centerX, centerY = screenW * 0.5, screenH * 0.5
+                render.setColor(Color(255, 58, 48, 255))
+                render.drawLine(centerX - 12, centerY, centerX + 12, centerY)
+                render.drawLine(centerX, centerY - 12, centerX, centerY + 12)
+                render.drawCircle(centerX, centerY, 7)
+                return
+            end
 
             render.setColor(Color(255,190,70,220))
             for i = 1, #trajectory - 1 do
@@ -644,9 +578,6 @@ if CLIENT then
             end
         end)
         local pos = net.readVector()
-        local dir = net.readVector()
-        local ok, err = pcall(muzzleBlast, pos, dir)
-        if not ok then print("muzzleBlast: " .. tostring(err)) end
         pcall(playEvent, "shot", pos)
     end)
 
