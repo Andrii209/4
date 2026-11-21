@@ -44,10 +44,7 @@ local TRAIL_START = 14
 local TRAIL_END   = 2
 local TRAIL_LIFE  = 0.7
 
-local BOOM_SCALE = 50
-local BOOM_HELI_SCALE = 42
-local BOOM_MAGNITUDE = 45
-local BOOM_SHOCKWAVE_MIN = 1000
+local BOOM_SCALE = 60
 local BOOM_FIRE_FX = { "explosion_huge", "explosion_huge_b", "building_explosion" }
 local BOOM_SMOKE_FX = { "generic_smoke", "smokegrenade", "smoke_trail" }
 local SMOKE_FX   = "smoke_trail"
@@ -156,10 +153,10 @@ if SERVER then
         net.writeUInt(s.id, 16)
         net.writeVector(pos)
         net.send()
-        effect.create("Explosion", { origin = pos, scale = BOOM_SCALE, magnitude = BOOM_MAGNITUDE })
-        effect.create("HelicopterMegaBomb", { origin = pos, scale = BOOM_HELI_SCALE, magnitude = BOOM_MAGNITUDE })
-        local shockwaveRadius = math.max(getRadius(), BOOM_SHOCKWAVE_MIN)
-        effect.beamRingPoint(pos, 0.95, 38, shockwaveRadius, 44, 10, Color(255, 180, 105))
+        effect.create("Explosion", { origin = pos, scale = BOOM_SCALE, magnitude = BOOM_SCALE })
+        effect.create("HelicopterMegaBomb", { origin = pos, scale = BOOM_SCALE, magnitude = BOOM_SCALE })
+        local shockwaveRadius = math.max(getRadius(), 1400)
+        effect.beamRingPoint(pos, 1.1, 45, shockwaveRadius, 52, 12, Color(255, 190, 115))
         pcall(applyBlastDamage, pos)
     end
 
@@ -350,28 +347,28 @@ if CLIENT then
         pcall(function() em:setParticleCullRadius(1800) end)
 
         if smokeMat then
-            for i = 1, 36 do
+            for i = 1, 44 do
                 local direction = Vector(math.random(-100, 100), math.random(-100, 100), math.random(-15, 100))
                 local length = direction:getLength()
                 if length > 0 then direction = direction / length end
-                local velocity = direction * math.random(120, 320) + Vector(0, 0, math.random(75, 175))
-                local life = math.random(45, 65) / 10
-                addImpactParticle(em, smokeMat, pos + Vector(0, 0, math.random(0, 32)),
-                    math.random(70, 115), math.random(400, 680), math.random(160, 215), life,
-                    velocity, Vector(0, 0, math.random(10, 28)), math.random(18, 28) / 10,
+                local velocity = direction * math.random(140, 360) + Vector(0, 0, math.random(90, 220))
+                local life = math.random(50, 75) / 10
+                addImpactParticle(em, smokeMat, pos + Vector(0, 0, math.random(0, 36)),
+                    math.random(85, 135), math.random(480, 820), math.random(175, 225), life,
+                    velocity, Vector(0, 0, math.random(12, 32)), math.random(18, 28) / 10,
                     Color(math.random(68, 98), math.random(66, 94), math.random(64, 92)))
             end
         end
 
         if flameMat then
-            for i = 1, 16 do
+            for i = 1, 20 do
                 local direction = Vector(math.random(-100, 100), math.random(-100, 100), math.random(-25, 100))
                 local length = direction:getLength()
                 if length > 0 then direction = direction / length end
-                local velocity = direction * math.random(380, 900) + Vector(0, 0, math.random(100, 330))
-                addImpactParticle(em, flameMat, pos + direction * math.random(0, 38),
-                    math.random(85, 150), math.random(10, 30), 255, math.random(26, 58) / 100,
-                    velocity, Vector(0, 0, math.random(-260, -100)), math.random(18, 28) / 10,
+                local velocity = direction * math.random(450, 1050) + Vector(0, 0, math.random(120, 420))
+                addImpactParticle(em, flameMat, pos + direction * math.random(0, 45),
+                    math.random(100, 175), math.random(12, 35), 255, math.random(28, 65) / 100,
+                    velocity, Vector(0, 0, math.random(-300, -120)), math.random(18, 28) / 10,
                     Color(255, math.random(82, 170), math.random(18, 42)))
             end
         end
