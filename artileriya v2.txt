@@ -34,7 +34,8 @@ local MODEL_ANG  = Angle(90, 0, 0)
 local SPEED      = 2500
 local ELEVATION  = 45
 local GRAVITY    = 600
-local MUZZLE_OFF = 70
+local MUZZLE_OFF = 70 -- positive local X is the front of the chip
+local MUZZLE_UP  = 8  -- small offset along the chip's local up axis
 local FIRE_DELAY = 1.5
 local MAX_FLIGHT = 20
 
@@ -76,11 +77,12 @@ if SERVER then
         local elev  = wire.ports.Elevation ~= 0 and wire.ports.Elevation or ELEVATION
         local speed = wire.ports.Speed     ~= 0 and wire.ports.Speed     or SPEED
         local c   = chip()
-        local fwd = c:getForward()                 --  
+        local fwd = c:getForward()
         local rad = math.rad(elev)
         local dir = fwd * math.cos(rad) + Vector(0,0,1) * math.sin(rad)
         dir = dir / dir:getLength()
-        local pos = c:getPos() + fwd * MUZZLE_OFF + Vector(0,0,8)
+        -- Spawn from the chip's local +X face, so both firing and prediction use its front muzzle.
+        local pos = c:localToWorld(Vector(MUZZLE_OFF, 0, MUZZLE_UP))
         return pos, dir, speed
     end
 
