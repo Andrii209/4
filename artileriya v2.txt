@@ -201,6 +201,7 @@ if SERVER then
             for _, point in ipairs(points) do
                 net.writeVector(point)
             end
+            -- Trajectory data is private HUD state; never broadcast it to every client.
             net.send(ow)
         end
 
@@ -493,16 +494,12 @@ if CLIENT then
 
     -- ===== Impact camera: hold G to replace the normal view with a top-down view. =====
     local trajectory, predictPos, marker
-    local function cameraOwner()
-        local lp = player()
-        return lp and lp:isValid() and lp == owner()
-    end
-
     local permissionSetup, cameraPromptSent, lastPermissionTry = false, false, 0
     local cameraHudMissing = false
     local function isOwnerClient()
         local lp = player()
-        return lp and lp:isValid() and lp == owner()
+        local chipOwner = owner()
+        return lp and lp:isValid() and chipOwner and chipOwner:isValid() and lp == chipOwner
     end
     local function setupImpactCameraRequest()
         if permissionSetup or not isOwnerClient() then return end
@@ -525,13 +522,13 @@ if CLIENT then
     end
 
     local function impactCameraHeld()
-        if not hasImpactCameraPermission() or not cameraOwner() or not predictPos then return false end
+        if not hasImpactCameraPermission() or not isOwnerClient() or not predictPos then return false end
         local ok, down = pcall(input.isKeyDown, KEY.G)
         return ok and down == true
     end
 
     hook.add("think", "arty_impact_camera_permission", function()
-        if not isOwnerClient() or not cameraOwner() then return end
+        if not isOwnerClient() then return end
         setupImpactCameraRequest()
         if cameraPromptSent or (hasImpactCameraPermission() and hasImpactFxPermissions()) then return end
         local now = timer.realtime()
@@ -547,7 +544,7 @@ if CLIENT then
     end)
 
     hook.add("inputbindpressed", "arty_hold_g_context_menu", function(bind)
-        if bind ~= "+menu" or not isOwnerClient() or not cameraOwner() or not predictPos then return end
+        if bind ~= "+menu" or not isOwnerClient() or not predictPos then return end
         local ok, down = pcall(input.isKeyDown, KEY.G)
         if ok and down then return true end
     end)
@@ -585,7 +582,7 @@ if CLIENT then
     end)
 
     local function updateMarker(cameraActive)
-        local ownerActive = cameraOwner()
+        local ownerActive = isOwnerClient()
         if not ownerActive then
             trajectory = nil
             predictPos = nil
@@ -597,6 +594,7 @@ if CLIENT then
                 markerPos = impactCameraPosition - impactCameraOffset
             end
             if not marker or not marker:isValid() then
+                -- This is a clientside hologram and is created only for the chip owner.
                 marker = hologram.create(markerPos, Angle(0,0,0), MARKER_MODEL)
                 if marker then marker:setColor(MARKER_COLOR) end
             end
@@ -612,7 +610,7 @@ if CLIENT then
         for i = 1, count do
             points[i] = net.readVector()
         end
-        if count >= 2 and cameraOwner() then
+        if count >= 2 and isOwnerClient() then
             trajectory = points
             predictPos = points[count]
         else
@@ -630,9 +628,9 @@ if CLIENT then
         updateMarker(cameraActive)
     end)
 
-    -- No render-target inset: the actual game view is switched only while G is held.
+    -- Screen-space trajectory, impact marker, and crosshair are rendered only on the chip owner's client.
     hook.add("drawhud", "arty_hud", function()
-        if not cameraOwner() then return end
+        if not isOwnerClient() then return end
         pcall(function()
             local screenW, screenH = render.getGameResolution()
             local cameraActive = impactCameraHeld()
