@@ -72,6 +72,22 @@ if SERVER then
     local lastThink = timer.curtime()
     local lastPredict = 0
 
+    -- Starfall CalcView only runs for clients connected to this chip's HUD.
+    -- Connect that HUD to the chip owner only so the owner's view can be overridden.
+    local ownerHudPlayer, ownerHudWarning
+    local function ensureOwnerHud()
+        local ow = owner()
+        if not ow or not ow:isValid() or ow == ownerHudPlayer then return end
+        local ok, err = pcall(enableHud, ow, true)
+        if ok then
+            ownerHudPlayer = ow
+        elseif not ownerHudWarning then
+            ownerHudWarning = true
+            print("M777: couldn't enable the owner-only HUD required by the impact camera: " .. tostring(err))
+        end
+    end
+    ensureOwnerHud()
+
     -- Wire Cooldown is measured in seconds; 0 keeps FIRE_DELAY and other values clamp to 0.1-60.
     -- Connect Wire inputs Damage and Radius to customize the blast; 0 keeps the defaults above.
     local function getDamage()
@@ -129,23 +145,59 @@ if SERVER then
         return points
     end
 
+    local damageWarnings = {}
+    local BLAST_QUERY_PADDING = 512
+    local function warnDamageIssue(className, message, permissionDenied)
+        if damageWarnings[className] then return end
+        damageWarnings[className] = true
+        local permissionHint = permissionDenied
+            and " Configure the server's Starfall entities.applyDamage permission to allow this target."
+            or ""
+        print("M777: blast damage failed for " .. className .. ": " .. tostring(message) .. permissionHint)
+    end
+
     local function applyBlastDamage(pos)
         local radius, damage = getRadius(), getDamage()
         if damage <= 0 then return end
-        local ok, list = pcall(find.inSphere, pos, radius)
-        if not ok then return end
+
+        -- Search a little beyond the blast radius so large vehicle bounds can overlap it.
+        local ok, list = pcall(find.inSphere, pos, radius + BLAST_QUERY_PADDING)
+        if not ok then
+            warnDamageIssue("targets", list)
+            return
+        end
+
         for _, e in ipairs(list) do
             if e:isValid() then
                 local cls = e:getClass()
-                local isTarget = e:isPlayer() or e:isNPC()
+                local isVehicleClass = string.find(cls, "vehicle", 1, true) ~= nil
+                    or string.sub(cls, 1, 4) == "lvs_"
+                    or string.find(cls, "lunasflightschool", 1, true) ~= nil
+                    or string.sub(cls, 1, 4) == "lfs_"
+                    or string.sub(cls, 1, 4) == "wac_"
+                local isVehicle = e:isVehicle() or isVehicleClass
+                local isTarget = e:isPlayer() or e:isNPC() or isVehicle
                     or cls == "gmod_wire_explosive" or cls == "prop_physics"
+                    or cls == "prop_physics_multiplayer"
                 if isTarget then
-                    local d = (e:getPos() - pos):getLength()
-                    local dmg = damage * math.max(0, 1 - d / radius)
-                    if dmg > 0 then
-                        pcall(function() e:applyDamage(dmg, owner(), chip(), 64, pos) end)
-                        if cls == "gmod_wire_explosive" then
-                            pcall(wire.triggerInput, e, "Detonate", 1)
+                    local pointOK, targetPos = pcall(function() return e:getNearestPoint(pos) end)
+                    if not pointOK or not targetPos then targetPos = e:getPos() end
+                    local distance = (targetPos - pos):getLength()
+                    if distance <= radius then
+                        local amount = damage * math.max(0, 1 - distance / radius)
+                        if amount > 0 then
+                            local permissionOK, allowed, reason = pcall(hasPermission, "entities.applyDamage", e)
+                            if not permissionOK or not allowed then
+                                warnDamageIssue(cls, permissionOK and reason or allowed, true)
+                            else
+                                local applied, err = pcall(function()
+                                    e:applyDamage(amount, owner(), chip(), 64, targetPos)
+                                end)
+                                if not applied then warnDamageIssue(cls, err) end
+                            end
+                            if cls == "gmod_wire_explosive" then
+                                pcall(wire.triggerInput, e, "Detonate", 1)
+                            end
                         end
                     end
                 end
@@ -186,6 +238,7 @@ if SERVER then
     end
 
     hook.add("think", "arty", function()
+        ensureOwnerHud()
         local t = timer.curtime()
         local dt = math.min(t - lastThink, 0.1)
         lastThink = t
