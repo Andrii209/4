@@ -183,9 +183,9 @@ if SERVER then
         local dt = math.min(t - lastThink, 0.1)
         lastThink = t
 
-        -- Send the predicted arc only to the owner, and only while they are seated.
+        -- The server owns trajectory prediction; send it to the chip owner for their client camera.
         local ow = owner()
-        if ow and ow:isValid() and ow:inVehicle() and t - lastPredict > PREDICT_RATE then
+        if ow and ow:isValid() and t - lastPredict > PREDICT_RATE then
             lastPredict = t
             local pos, dir, speed = fireParams()
             local points = predictTrajectory(pos, dir, speed)
@@ -486,12 +486,13 @@ if CLIENT then
 
     -- ===== Impact camera: hold G to replace the normal view with a top-down view. =====
     local trajectory, predictPos, marker
-    local function seatedOwner()
+    local function cameraOwner()
         local lp = player()
-        return lp and lp:isValid() and lp == owner() and lp:inVehicle()
+        return lp and lp:isValid() and lp == owner()
     end
 
     local permissionSetup, cameraPromptSent, lastPermissionTry = false, false, 0
+    local cameraHudMissing = false
     local function isOwnerClient()
         local lp = player()
         return lp and lp:isValid() and lp == owner()
@@ -517,24 +518,29 @@ if CLIENT then
     end
 
     local function impactCameraHeld()
-        if not hasImpactCameraPermission() or not seatedOwner() or not predictPos then return false end
+        if not hasImpactCameraPermission() or not cameraOwner() or not predictPos then return false end
         local ok, down = pcall(input.isKeyDown, KEY.G)
         return ok and down == true
     end
 
     hook.add("think", "arty_impact_camera_permission", function()
-        if not isOwnerClient() or not seatedOwner() then return end
+        if not isOwnerClient() or not cameraOwner() then return end
         setupImpactCameraRequest()
         if cameraPromptSent or (hasImpactCameraPermission() and hasImpactFxPermissions()) then return end
         local now = timer.realtime()
         if now - lastPermissionTry < 1 then return end
         lastPermissionTry = now
-        local ok = pcall(sendPermissionRequest)
-        if ok then cameraPromptSent = true end
+        local ok, err = pcall(sendPermissionRequest)
+        if ok then
+            cameraPromptSent = true
+            cameraHudMissing = false
+        else
+            cameraHudMissing = string.find(string.lower(tostring(err)), "hud", 1, true) ~= nil
+        end
     end)
 
     hook.add("inputbindpressed", "arty_hold_g_context_menu", function(bind)
-        if bind ~= "+menu" or not isOwnerClient() or not seatedOwner() or not predictPos then return end
+        if bind ~= "+menu" or not isOwnerClient() or not cameraOwner() or not predictPos then return end
         local ok, down = pcall(input.isKeyDown, KEY.G)
         if ok and down then return true end
     end)
@@ -572,13 +578,13 @@ if CLIENT then
     end)
 
     local function updateMarker(cameraActive)
-        local seated = seatedOwner()
-        if not seated then
+        local ownerActive = cameraOwner()
+        if not ownerActive then
             trajectory = nil
             predictPos = nil
         end
 
-        if predictPos and seated then
+        if predictPos and ownerActive then
             local markerPos = predictPos
             if cameraActive and impactCameraPosition then
                 markerPos = impactCameraPosition - impactCameraOffset
@@ -599,7 +605,7 @@ if CLIENT then
         for i = 1, count do
             points[i] = net.readVector()
         end
-        if count >= 2 and seatedOwner() then
+        if count >= 2 and cameraOwner() then
             trajectory = points
             predictPos = points[count]
         else
@@ -619,13 +625,15 @@ if CLIENT then
 
     -- No render-target inset: the actual game view is switched only while G is held.
     hook.add("drawhud", "arty_hud", function()
-        if not seatedOwner() then return end
+        if not cameraOwner() then return end
         pcall(function()
             local screenW, screenH = render.getGameResolution()
             local cameraActive = impactCameraHeld()
             local status = "HOLD G: IMPACT VIEW"
             if cameraActive then
                 status = "IMPACT VIEW - RELEASE G"
+            elseif cameraHudMissing then
+                status = "CONNECT STARFALL HUD"
             elseif not hasImpactCameraPermission() then
                 status = "ALLOW CAMERA + INPUT"
             elseif not predictPos then
