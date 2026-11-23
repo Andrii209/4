@@ -72,20 +72,24 @@ if SERVER then
     local lastPredict = 0
 
     -- Starfall CalcView only runs for clients connected to this chip's HUD.
-    -- Connect that HUD to the chip owner only so the owner's view can be overridden.
-    local ownerHudPlayer, ownerHudWarning
-    local function ensureOwnerHud()
+    -- Connect it only while the chip owner is seated so the HUD and camera are seat-only.
+    local ownerHudWarning
+    local function syncOwnerHud()
         local ow = owner()
-        if not ow or not ow:isValid() or ow == ownerHudPlayer then return end
-        local ok, err = pcall(enableHud, ow, true)
+        if not ow or not ow:isValid() or not ow:isPlayer() then return end
+
+        local shouldEnable = ow:inVehicle()
+        if ow:isHUDActive() == shouldEnable then return end
+
+        local ok, err = pcall(enableHud, ow, shouldEnable)
         if ok then
-            ownerHudPlayer = ow
+            ownerHudWarning = false
         elseif not ownerHudWarning then
             ownerHudWarning = true
-            print("M777: couldn't enable the owner-only HUD required by the impact camera: " .. tostring(err))
+            print("M777: couldn't sync the owner-only HUD with the seat state: " .. tostring(err))
         end
     end
-    ensureOwnerHud()
+    syncOwnerHud()
 
     -- Wire Cooldown is measured in seconds; 0 keeps FIRE_DELAY and other values clamp to 0.1-60.
     -- Connect Wire inputs Damage and Radius to customize the blast; 0 keeps the defaults above.
@@ -258,7 +262,7 @@ if SERVER then
     end
 
     hook.add("think", "arty", function()
-        ensureOwnerHud()
+        syncOwnerHud()
         local t = timer.curtime()
         local dt = math.min(t - lastThink, 0.1)
         lastThink = t
@@ -558,7 +562,8 @@ if CLIENT then
     local function isOwnerClient()
         local lp = player()
         local chipOwner = owner()
-        return lp and lp:isValid() and chipOwner and chipOwner:isValid() and lp == chipOwner
+        return lp and lp:isValid() and chipOwner and chipOwner:isValid()
+            and lp == chipOwner and lp:inVehicle()
     end
     local function setupImpactCameraRequest()
         if permissionSetup or not isOwnerClient() then return end
