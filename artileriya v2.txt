@@ -49,7 +49,6 @@ local TRAIL_LIFE  = 0.7
 local BOOM_SCALE = 60
 local BOOM_FIRE_FX = { "explosion_huge", "explosion_huge_b", "building_explosion" }
 local BOOM_SMOKE_FX = { "generic_smoke", "smokegrenade", "smoke_trail" }
-local SMOKE_FX   = "smoke_trail"
 local ANCHOR_MODEL = "models/hunter/blocks/cube025x025x025.mdl"
 local IMPACT_SMOKE_MAT = "particle/particle_smokegrenade"
 local IMPACT_FLAME_MAT = "sprites/flamelet1"
@@ -147,20 +146,18 @@ if SERVER then
 
     local damageWarnings = {}
     local BLAST_QUERY_PADDING = 512
-    local function warnDamageIssue(className, message, permissionDenied)
+    local GAME_BLAST_RADIUS_LIMIT = 1500
+    local function warnDamageIssue(className, message, permissionName)
         if damageWarnings[className] then return end
         damageWarnings[className] = true
-        local permissionHint = permissionDenied
-            and " Configure the server's Starfall entities.applyDamage permission to allow this target."
+        local permissionHint = permissionName
+            and " Configure the server's Starfall " .. permissionName .. " permission for this damage path."
             or ""
         print("M777: blast damage failed for " .. className .. ": " .. tostring(message) .. permissionHint)
     end
 
-    local function applyBlastDamage(pos)
-        local radius, damage = getRadius(), getDamage()
-        if damage <= 0 then return end
-
-        -- Search a little beyond the blast radius so large vehicle bounds can overlap it.
+    local function applyTargetDamage(pos, radius, damage, useEntityDamage)
+        -- This sweep also triggers Wire explosives when the engine blast path is used.
         local ok, list = pcall(find.inSphere, pos, radius + BLAST_QUERY_PADDING)
         if not ok then
             warnDamageIssue("targets", list)
@@ -175,8 +172,7 @@ if SERVER then
                     or string.find(cls, "lunasflightschool", 1, true) ~= nil
                     or string.sub(cls, 1, 4) == "lfs_"
                     or string.sub(cls, 1, 4) == "wac_"
-                local isVehicle = e:isVehicle() or isVehicleClass
-                local isTarget = e:isPlayer() or e:isNPC() or isVehicle
+                local isTarget = e:isPlayer() or e:isNPC() or e:isVehicle() or isVehicleClass
                     or cls == "gmod_wire_explosive" or cls == "prop_physics"
                     or cls == "prop_physics_multiplayer"
                 if isTarget then
@@ -184,25 +180,51 @@ if SERVER then
                     if not pointOK or not targetPos then targetPos = e:getPos() end
                     local distance = (targetPos - pos):getLength()
                     if distance <= radius then
+                        if cls == "gmod_wire_explosive" then
+                            pcall(wire.triggerInput, e, "Detonate", 1)
+                        end
                         local amount = damage * math.max(0, 1 - distance / radius)
-                        if amount > 0 then
+                        if useEntityDamage and amount > 0 then
                             local permissionOK, allowed, reason = pcall(hasPermission, "entities.applyDamage", e)
                             if not permissionOK or not allowed then
-                                warnDamageIssue(cls, permissionOK and reason or allowed, true)
+                                warnDamageIssue(cls, permissionOK and reason or allowed, "entities.applyDamage")
                             else
                                 local applied, err = pcall(function()
                                     e:applyDamage(amount, owner(), chip(), 64, targetPos)
                                 end)
                                 if not applied then warnDamageIssue(cls, err) end
                             end
-                            if cls == "gmod_wire_explosive" then
-                                pcall(wire.triggerInput, e, "Detonate", 1)
-                            end
                         end
                     end
                 end
             end
         end
+    end
+
+    local function applyBlastDamage(pos)
+        local radius, damage = getRadius(), getDamage()
+        if damage <= 0 then return end
+
+        -- Prefer Starfall's native util.BlastDamage wrapper: it handles the engine's
+        -- full area-damage rules for players and vehicle entities, unlike manual filters.
+        local areaDamageApplied = false
+        if radius <= GAME_BLAST_RADIUS_LIMIT then
+            local permissionOK, allowed, reason = pcall(hasPermission, "game.blastDamage")
+            if permissionOK and allowed then
+                local applied, err = pcall(game.blastDamage, pos, radius, damage)
+                if applied then
+                    areaDamageApplied = true
+                else
+                    warnDamageIssue("game.blastDamage", err)
+                end
+            else
+                warnDamageIssue("game.blastDamage", permissionOK and reason or allowed, "game.blastDamage")
+            end
+        end
+
+        -- Fall back to per-entity damage if the native blast is unavailable/denied.
+        -- Starfall's native blast caps its radius at 1500 units; retain larger Wire radii.
+        applyTargetDamage(pos, radius, damage, not areaDamageApplied)
     end
 
     local function explode(s, pos)
@@ -214,8 +236,6 @@ if SERVER then
         net.send()
         effect.create("Explosion", { origin = pos, scale = BOOM_SCALE, magnitude = BOOM_SCALE })
         effect.create("HelicopterMegaBomb", { origin = pos, scale = BOOM_SCALE, magnitude = BOOM_SCALE })
-        local shockwaveRadius = math.max(getRadius(), 1400)
-        effect.beamRingPoint(pos, 1.1, 45, shockwaveRadius, 52, 12, Color(255, 190, 115))
         pcall(applyBlastDamage, pos)
     end
 
@@ -351,8 +371,7 @@ if CLIENT then
     local function muzzleFlashFx(pos, dir)
         if not hasPermission("particle.create") then return end
         local flameMat = loadImpactMaterial(IMPACT_FLAME_MAT)
-        local smokeMat = loadImpactMaterial(IMPACT_SMOKE_MAT)
-        if not flameMat and not smokeMat then return end
+        if not flameMat then return end
 
         local now = timer.realtime()
         if lastMuzzleFlash and now - lastMuzzleFlash < 0.14 then return end
@@ -378,19 +397,6 @@ if CLIENT then
                     math.random(12, 20), math.random(2, 5), 220, math.random(12, 22) / 100,
                     velocity, Vector(0, 0, -35), 2.2, Color(255, math.random(150, 210), 105),
                     math.random(10, 18), math.random(34, 62))
-            end
-        end
-
-        if smokeMat then
-            for i = 1, 9 do
-                local velocity = dir * math.random(50, 140)
-                    + right * math.random(-75, 75) + up * math.random(18, 85)
-                local life = math.random(8, 11) / 10
-                addImpactParticle(em, smokeMat, origin + dir * math.random(0, 26)
-                    + up * math.random(-6, 14), math.random(18, 30), math.random(90, 155),
-                    math.random(125, 170), life, velocity, Vector(0, 0, math.random(5, 18)),
-                    math.random(18, 26) / 10,
-                    Color(math.random(72, 92), math.random(70, 88), math.random(68, 84)))
             end
         end
 
@@ -735,13 +741,11 @@ if CLIENT then
         end)
     end)
 
-    local trails, dead = {}, {}
+    local dead = {}
     net.receive("arty_fire", function()
         local id = net.readUInt(16)
         net.readEntity(function(holo)
             if not holo or dead[id] then return end
-            local ok, fx = pcall(particleEffect.attach, holo, SMOKE_FX, 1)
-            if ok then trails[id] = fx end
             local ok2, ws = pcall(sound.create, holo, WHISTLE_PATH)
             if ok2 and ws then
                 pcall(function()
@@ -763,11 +767,6 @@ if CLIENT then
         local pos = net.readVector()
         dead[id] = true
         timer.simple(10, function() dead[id] = nil end)
-        local fx = trails[id]; trails[id] = nil
-        if fx and fx:isValid() then
-            fx:stopEmission()
-            timer.simple(4, function() if fx:isValid() then fx:destroy() end end)
-        end
         local w = whistleActive[id]; whistleActive[id] = nil
         if w then pcall(function() w.snd:stop(); w.snd:destroy() end) end
         pcall(bigBoomFx, pos)
