@@ -35,7 +35,9 @@ local SPEED      = 2500
 local GRAVITY    = 600
 local MUZZLE_OFF = 70 -- positive local X is the front of the chip
 local MUZZLE_UP  = 8  -- small offset along the chip's local up axis
-local FIRE_DELAY = 1.5
+local FIRE_DELAY = 1.5 -- Default cooldown when the Wire Cooldown input is 0.
+local MIN_COOLDOWN = 0.1
+local MAX_COOLDOWN = 60
 local MAX_FLIGHT = 20
 
 local TRAIL_MAT   = "trails/laser"
@@ -66,10 +68,11 @@ if SERVER then
         {"Fire","Elevation","Speed","Damage","Radius","Cooldown"},
         {"number","number","number","number","number","number"}
     )
-    local shells, shotId, lastFire = {}, 0, 0
+    local shells, shotId, lastFire = {}, 0, nil
     local lastThink = timer.curtime()
     local lastPredict = 0
 
+    -- Wire Cooldown is measured in seconds; 0 keeps FIRE_DELAY and other values clamp to 0.1-60.
     -- Connect Wire inputs Damage and Radius to customize the blast; 0 keeps the defaults above.
     local function getDamage()
         local value = wire.ports.Damage
@@ -81,7 +84,11 @@ if SERVER then
         if value == 0 then return RADIUS end
         return math.max(1, math.min(value, RADIUS_LIMIT))
     end
-    local function getCooldown() return math.max(0, wire.ports.Cooldown ~= 0 and wire.ports.Cooldown or FIRE_DELAY) end
+    local function getCooldown()
+        local value = wire.ports.Cooldown
+        if value <= 0 then return FIRE_DELAY end
+        return math.max(MIN_COOLDOWN, math.min(value, MAX_COOLDOWN))
+    end
 
     --  :    
     local function fireParams()
@@ -162,11 +169,11 @@ if SERVER then
 
     local function fire()
         local t = timer.curtime()
-        if t - lastFire < getCooldown() then return end
-        lastFire = t
+        if lastFire and t - lastFire < getCooldown() then return end
         local pos, dir, speed = fireParams()
         local holo = hologram.create(pos, shellAng(dir), MODEL)
         if not holo then return end
+        lastFire = t
         holo:setTrails(TRAIL_START, TRAIL_END, TRAIL_LIFE, TRAIL_MAT, TRAIL_COLOR, nil, true)
         shotId = (shotId + 1) % 65536
         shells[shotId] = { id = shotId, holo = holo, pos = pos, vel = dir * speed, born = t }
@@ -219,7 +226,7 @@ if SERVER then
         fire()
         return ""
     end)
-    print("M777: Fire / !fire | Wire Damage and Radius inputs (0 = defaults)")
+    print("M777: Fire / !fire | Wire Cooldown: seconds (0 = 1.5, range 0.1-60); Damage/Radius: 0 = defaults")
 end
 
 -- =====================  =====================
